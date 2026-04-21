@@ -1,0 +1,7 @@
+.venv/
+.dagster_home/
+__pycache__/
+*.egg-info/
+data/
+.env
+*.db
