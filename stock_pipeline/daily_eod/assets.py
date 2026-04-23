@@ -82,8 +82,7 @@ def raw_daily(
 
     src = kite if source == "kite" else csv
     context.log.info(
-        f"Fetching {symbol} (token={token}) for [{from_date}, {to_date}] "
-        f"via {source}"
+        f"Fetching {symbol} (token={token}) for [{from_date}, {to_date}] via {source}"
     )
     return src.fetch_daily_eq_range(
         symbol=symbol, instrument_token=token, from_date=from_date, to_date=to_date
@@ -111,6 +110,6 @@ def daily_parquet(
         return
 
     symbol = context.partition_key
-    out = DATA_DIR / "equity" / f"{symbol}.parquet"
+    out = DATA_DIR / "daily" / "eq" / f"{symbol}.parquet"
     rows = _write_with_dedupe(processed_daily, out)
     context.log.info(f"Wrote {out} ({rows} rows)")

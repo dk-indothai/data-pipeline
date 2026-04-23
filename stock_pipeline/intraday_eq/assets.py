@@ -126,7 +126,7 @@ def intraday_parquet(
         return
 
     symbol = context.partition_key
-    base = DATA_DIR / "intraday" / "equity" / symbol
+    base = DATA_DIR / "intraday" / "eq" / symbol
     base.mkdir(parents=True, exist_ok=True)
 
     # Split by trading_date and write one parquet per day. Writes overwrite
