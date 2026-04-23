@@ -13,6 +13,9 @@ from kiteconnect import KiteConnect
 
 # Kite's historical_data caps daily candles at 2000 days per call.
 _DAILY_CHUNK_DAYS = 2000
+# Minute-interval cap: 60 days per call. Wider intraday intervals allow more
+# (100 for 3–15 min, 200 for 30–60 min) but 60 is the safe floor for minute.
+_INTRADAY_MINUTE_CHUNK_DAYS = 60
 
 
 class KiteSource(ConfigurableResource):
@@ -98,6 +101,47 @@ class KiteSource(ConfigurableResource):
         df = pd.concat(frames, ignore_index=True)
         df["symbol"] = symbol
         df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
+        return df[["symbol", "date", "open", "high", "low", "close", "volume"]]
+
+    def fetch_intraday_eq_range(
+        self,
+        symbol: str,
+        instrument_token: int,
+        from_date: date,
+        to_date: date,
+        interval: str = "minute",
+    ) -> pd.DataFrame:
+        # Chunk the window at Kite's minute-interval cap. One Kite call per
+        # 60-day slice instead of one per trading day cuts requests ~40x.
+        # `oi=False` because equity candles never carry open interest.
+        client = self._client()
+        log = get_dagster_logger()
+        frames: list[pd.DataFrame] = []
+        cursor = from_date
+        while cursor <= to_date:
+            chunk_end = min(
+                cursor + timedelta(days=_INTRADAY_MINUTE_CHUNK_DAYS - 1), to_date
+            )
+            raw = client.historical_data(
+                instrument_token=instrument_token,
+                from_date=cursor,
+                to_date=chunk_end,
+                interval=interval,
+                oi=False,
+            )
+            if raw:
+                frames.append(pd.DataFrame(raw))
+            cursor = chunk_end + timedelta(days=1)
+
+        if not frames:
+            log.warning(
+                f"Kite returned no intraday data for {symbol} in [{from_date}, {to_date}]"
+            )
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        df["symbol"] = symbol
+        df["date"] = pd.to_datetime(df["date"]).astype(str)
         return df[["symbol", "date", "open", "high", "low", "close", "volume"]]
 
     def fetch_daily_fut(

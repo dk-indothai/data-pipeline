@@ -6,11 +6,15 @@ Reads pre-downloaded OHLCV from a directory laid out as:
     {root_dir}/daily/fut/{SYMBOL}.csv
     {root_dir}/daily/call/{SYMBOL}.csv
     {root_dir}/daily/put/{SYMBOL}.csv
+    {root_dir}/intraday/eq/{SYMBOL}.csv
 
 CSV schema: `date,open,high,low,close,volume` (plus `oi` when present).
 `date` is parsed leniently — the timestamp's calendar date is matched
 against the requested `on`, so both naive (`2000-01-03T05:30:00.000`)
 and tz-aware (`2015-02-02 09:15:00+05:30`) formats work.
+
+Daily methods return one row per day with `date` as an ISO date string.
+Intraday methods preserve the full timestamp as an ISO datetime string.
 
 Return shape matches KiteSource so call sites don't branch on source type.
 """
@@ -86,6 +90,38 @@ class CsvSource(ConfigurableResource):
 
         df["symbol"] = symbol
         df["date"] = df["date"].dt.date.astype(str)
+        return df[["symbol", "date", "open", "high", "low", "close", "volume"]]
+
+    def fetch_intraday_eq_range(
+        self,
+        symbol: str,
+        instrument_token: int,
+        from_date: date,
+        to_date: date,
+    ) -> pd.DataFrame:
+        # Read the per-symbol CSV once and filter to the whole range.
+        # instrument_token is unused here but kept to match KiteSource.
+        path = Path(self.root_dir) / "intraday" / "eq" / f"{symbol}.csv"
+        log = get_dagster_logger()
+        if not path.exists():
+            log.warning(f"CsvSource: no file at {path} for {symbol}")
+            return pd.DataFrame()
+
+        df = pd.read_csv(path)
+        # `format="mixed"` handles both naive and tz-aware timestamps.
+        df["date"] = pd.to_datetime(df["date"], utc=False, format="mixed")
+        mask = (df["date"].dt.date >= from_date) & (df["date"].dt.date <= to_date)
+        df = df.loc[mask].copy()
+        if df.empty:
+            log.warning(
+                f"CsvSource: no intraday rows for {symbol} in [{from_date}, {to_date}]"
+            )
+            return pd.DataFrame()
+
+        df["symbol"] = symbol
+        # Store full timestamp as string so parquet round-trips cleanly
+        # across pandas versions; downstream slices first 10 chars for date.
+        df["date"] = df["date"].astype(str)
         return df[["symbol", "date", "open", "high", "low", "close", "volume"]]
 
     def fetch_daily_fut(
