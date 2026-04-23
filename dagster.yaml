@@ -1,0 +1,19 @@
+# Dagster instance config. Copied into $DAGSTER_HOME by run.sh on startup.
+#
+# QueuedRunCoordinator + tag_concurrency_limits gives us per-symbol
+# serialization: overlapping runs for the same symbol queue behind each
+# other, but different symbols fan out freely. This prevents the
+# read-modify-write race on data/equity/{SYMBOL}.parquet in the
+# daily_parquet asset.
+#
+# `dagster/partition` is auto-applied by Dagster with the partition key
+# as its value — here, the equity symbol.
+run_coordinator:
+  module: dagster._core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    tag_concurrency_limits:
+      - key: "dagster/partition"
+        value:
+          applyLimitPerUniqueValue: true
+        limit: 1

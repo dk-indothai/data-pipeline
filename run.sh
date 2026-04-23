@@ -18,6 +18,10 @@ source .venv/bin/activate
 export DAGSTER_HOME="$PROJECT_DIR/.dagster_home"
 mkdir -p "$DAGSTER_HOME"
 
+# Sync instance config from the tracked template so DAGSTER_HOME can stay
+# gitignored while dagster.yaml lives in source control.
+cp "$PROJECT_DIR/dagster.yaml" "$DAGSTER_HOME/dagster.yaml"
+
 echo ">> DAGSTER_HOME=$DAGSTER_HOME"
 echo ">> UI will be at http://localhost:3000"
 echo

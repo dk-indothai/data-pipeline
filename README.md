@@ -79,3 +79,16 @@ Replace with a query against a dedicated table (`active_equity`,
 | Lean destination      | New terminal asset `daily_lean`                           |
 | Retries               | `retry_policy=` on `raw_daily` once real failures emerge  |
 | IOManagers            | Replace inline parquet writes when >2 destinations exist  |
+
+
+### Data
+- Daily
+  - Stock
+  - FnO
+- Intraday
+  - Stock
+  - FnO
+
+### Format
+- Parquet
+- Lean Compatiable
