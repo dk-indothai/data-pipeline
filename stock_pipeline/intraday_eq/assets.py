@@ -13,13 +13,14 @@ that had data; empty days are skipped).
 """
 
 from datetime import date as date_cls
-from pathlib import Path
 
 import pandas as pd
 from dagster import AssetExecutionContext, asset
 from sqlalchemy import select
 
 from stock_pipeline.core.db import PostgresResource
+from stock_pipeline.core.destinations.base import DEFAULT_STORAGE, TAG_STORAGE
+from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.models import Instrument
 from stock_pipeline.core.partitions import equity_symbols
 from stock_pipeline.core.sources.csv_source import CsvSource
@@ -31,8 +32,10 @@ from stock_pipeline.daily_eod.assets import (
     TAG_START_DATE,
 )
 
-DATA_DIR = Path("data")
 GROUP = "intraday_eq"
+
+# Whitelist grows as more Destination impls land (s3, drive_local, ...).
+_VALID_STORAGES = ("local",)
 
 # Earliest date present in the intraday CSVs; daily_eod's 2000-01-01 default
 # is too wide and would iterate ~15 years of weekends for nothing.
@@ -119,23 +122,30 @@ def processed_intraday(
 
 @asset(partitions_def=equity_symbols, group_name=GROUP)
 def intraday_parquet(
-    context: AssetExecutionContext, processed_intraday: pd.DataFrame
+    context: AssetExecutionContext,
+    processed_intraday: pd.DataFrame,
+    local: LocalStorage,
 ) -> None:
     if processed_intraday.empty:
         context.log.warning("Empty DataFrame — skipping write")
         return
 
+    storage = context.run.tags.get(TAG_STORAGE, DEFAULT_STORAGE)
+    if storage not in _VALID_STORAGES:
+        raise ValueError(
+            f"tag '{TAG_STORAGE}'='{storage}' invalid — must be one of {_VALID_STORAGES}"
+        )
+    dest = local  # only local impl today; dispatch grows when S3/Drive land.
+
     symbol = context.partition_key
-    base = DATA_DIR / "intraday" / "eq" / symbol
-    base.mkdir(parents=True, exist_ok=True)
 
     # Split by trading_date and write one parquet per day. Writes overwrite
     # atomically — re-materializing a range refreshes every file in scope.
     written = 0
     for trading_date, group in processed_intraday.groupby(TRADING_DATE_COL):
-        out = base / f"{trading_date}.parquet"
-        group.drop(columns=[TRADING_DATE_COL]).to_parquet(out, index=False)
-        context.log.info(f"Wrote {out} ({len(group)} rows)")
+        rel = f"intraday/eq/{symbol}/{trading_date}.parquet"
+        dest.write(group.drop(columns=[TRADING_DATE_COL]), rel)
+        context.log.info(f"Wrote {rel} ({len(group)} rows)")
         written += 1
 
-    context.log.info(f"{symbol}: wrote {written} parquet files")
+    context.log.info(f"{symbol}: wrote {written} parquet files via storage={storage}")

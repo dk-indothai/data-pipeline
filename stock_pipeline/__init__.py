@@ -5,6 +5,7 @@ import os
 from dagster import Definitions, EnvVar, load_assets_from_modules
 
 from stock_pipeline.core.db import PostgresResource
+from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.sources.csv_source import CsvSource
 from stock_pipeline.core.sources.kite import KiteSource
 from stock_pipeline.daily_eod import assets as daily_eod_assets
@@ -24,6 +25,7 @@ defs = Definitions(
             access_token=EnvVar("KITE_ACCESS_TOKEN"),
         ),
         "csv": CsvSource(root_dir=os.getenv("CSV_ROOT_DIR", "CustomSource")),
+        "local": LocalStorage(base_dir=os.getenv("LOCAL_STORAGE_DIR", "data")),
         "db": PostgresResource(url=EnvVar("DATABASE_URL")),
     },
 )
