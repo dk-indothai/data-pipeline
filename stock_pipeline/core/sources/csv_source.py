@@ -24,6 +24,20 @@ from pathlib import Path
 import pandas as pd
 from dagster import ConfigurableResource, get_dagster_logger
 
+# Rename map for legacy option CSVs that use the public output-schema casing
+# directly. Applied with rename(), so missing keys are no-ops — safe for
+# lowercase-schema files too. Extra columns (Symbol, Strike, ...) get dropped
+# when the method projects to the final column list.
+_OP_COLUMN_NORMALIZE = {
+    "DateTime": "date",
+    "Open": "open",
+    "High": "high",
+    "Low": "low",
+    "Close": "close",
+    "Volume": "volume",
+    "Open Interest": "oi",
+}
+
 
 class CsvSource(ConfigurableResource):
     """File-backed source for offline replays and tests.
@@ -123,6 +137,50 @@ class CsvSource(ConfigurableResource):
         # across pandas versions; downstream slices first 10 chars for date.
         df["date"] = df["date"].astype(str)
         return df[["symbol", "date", "open", "high", "low", "close", "volume"]]
+
+    def fetch_daily_op_range(
+        self,
+        contract: str,
+        underlying: str,
+        instrument_token: int,
+        from_date: date,
+        to_date: date,
+    ) -> pd.DataFrame:
+        # Layout: {root}/daily/op/{UNDERLYING}/{CONTRACT}.csv. The underlying
+        # subdir keeps the options tree navigable even with 50k+ contracts.
+        # instrument_token is unused here but kept to match KiteSource.
+        path = Path(self.root_dir) / "daily" / "op" / underlying / f"{contract}.csv"
+        log = get_dagster_logger()
+        if not path.exists():
+            log.warning(f"CsvSource: no file at {path} for {contract}")
+            return pd.DataFrame()
+
+        df = pd.read_csv(path)
+        # Legacy option CSVs ship with the output-schema casing (DateTime,
+        # Open, ...). Normalize to the lowercase raw schema the asset/DB-
+        # enrichment stage expects; a no-op for already-lowercase files.
+        df = df.rename(columns=_OP_COLUMN_NORMALIZE)
+        if "date" not in df.columns:
+            log.warning(
+                f"CsvSource: {path} missing `date`/`DateTime` column "
+                f"(found: {list(df.columns)})"
+            )
+            return pd.DataFrame()
+
+        df["date"] = pd.to_datetime(df["date"], utc=False, format="mixed")
+        mask = (df["date"].dt.date >= from_date) & (df["date"].dt.date <= to_date)
+        df = df.loc[mask].copy()
+        if df.empty:
+            log.warning(
+                f"CsvSource: no op rows for {contract} in [{from_date}, {to_date}]"
+            )
+            return pd.DataFrame()
+
+        df["date"] = df["date"].astype(str)
+        cols = ["date", "open", "high", "low", "close", "volume"]
+        if "oi" in df.columns:
+            cols.append("oi")
+        return df[cols]
 
     def fetch_daily_fut(
         self, symbol: str, instrument_token: int, on: date

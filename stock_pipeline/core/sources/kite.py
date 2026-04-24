@@ -144,6 +144,50 @@ class KiteSource(ConfigurableResource):
         df["date"] = pd.to_datetime(df["date"]).astype(str)
         return df[["symbol", "date", "open", "high", "low", "close", "volume"]]
 
+    def fetch_daily_op_range(
+        self,
+        contract: str,
+        underlying: str,  # noqa: ARG002 -- signature parity with CsvSource
+        instrument_token: int,
+        from_date: date,
+        to_date: date,
+    ) -> pd.DataFrame:
+        # Options always fetched with oi=True; OI is free and strategies need it.
+        # Chunked at _DAILY_CHUNK_DAYS (2000) same as equity-daily.
+        # `underlying` is unused — Kite routes off instrument_token alone — but
+        # kept in the signature so the asset can swap kite/csv without branching.
+        client = self._client()
+        log = get_dagster_logger()
+        frames: list[pd.DataFrame] = []
+        cursor = from_date
+        while cursor <= to_date:
+            chunk_end = min(
+                cursor + timedelta(days=_DAILY_CHUNK_DAYS - 1), to_date
+            )
+            raw = client.historical_data(
+                instrument_token=instrument_token,
+                from_date=cursor,
+                to_date=chunk_end,
+                interval="day",
+                oi=True,
+            )
+            if raw:
+                frames.append(pd.DataFrame(raw))
+            cursor = chunk_end + timedelta(days=1)
+
+        if not frames:
+            log.warning(
+                f"Kite returned no op data for {contract} in [{from_date}, {to_date}]"
+            )
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        df["date"] = pd.to_datetime(df["date"]).dt.date.astype(str)
+        cols = ["date", "open", "high", "low", "close", "volume"]
+        if "oi" in df.columns:
+            cols.append("oi")
+        return df[cols]
+
     def fetch_daily_fut(
         self, symbol: str, instrument_token: int, on: date
     ) -> pd.DataFrame:

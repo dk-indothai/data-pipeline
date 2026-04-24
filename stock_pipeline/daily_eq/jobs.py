@@ -4,7 +4,7 @@ dialog's Tags section."""
 
 from dagster import AssetSelection, define_asset_job
 
-from stock_pipeline.daily_eod.assets import (
+from stock_pipeline.daily_eq.assets import (
     TAG_END_DATE,
     TAG_SOURCE,
     TAG_START_DATE,

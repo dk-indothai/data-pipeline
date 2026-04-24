@@ -25,7 +25,7 @@ from stock_pipeline.core.models import Instrument
 from stock_pipeline.core.partitions import equity_symbols
 from stock_pipeline.core.sources.csv_source import CsvSource
 from stock_pipeline.core.sources.kite import KiteSource
-from stock_pipeline.daily_eod.assets import (
+from stock_pipeline.daily_eq.assets import (
     DEFAULT_SOURCE,
     TAG_END_DATE,
     TAG_SOURCE,
