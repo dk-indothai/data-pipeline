@@ -19,17 +19,18 @@ from dagster import AssetExecutionContext, asset
 from sqlalchemy import select
 
 from stock_pipeline.core.db import PostgresResource
-from stock_pipeline.core.destinations.base import DEFAULT_STORAGE, TAG_STORAGE
 from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.models import Instrument
 from stock_pipeline.core.partitions import equity_symbols
 from stock_pipeline.core.sources.csv_source import CsvSource
 from stock_pipeline.core.sources.kite import KiteSource
-from stock_pipeline.daily_eq.assets import (
+from stock_pipeline.core.tags import (
     DEFAULT_SOURCE,
+    DEFAULT_STORAGE,
     TAG_END_DATE,
     TAG_SOURCE,
     TAG_START_DATE,
+    TAG_STORAGE,
 )
 
 GROUP = "intraday_eq"

@@ -4,14 +4,13 @@ Storage backends read/write parquet dataframes at relative paths. Concrete
 impls (LocalStorage, later S3Storage, DriveLocalStorage) own their own
 root/bucket/credentials; callers pass rel_paths like
 "daily/eq/RELIANCE.parquet". Storage never knows about "daily" or "intraday".
+
+Tag keys (TAG_STORAGE, DEFAULT_STORAGE) moved to stock_pipeline.core.tags
+for centralization across groups.
 """
 
 import pandas as pd
 from dagster import ConfigurableResource
-
-# Run-tag key selecting which destination to write to.
-TAG_STORAGE = "storage"
-DEFAULT_STORAGE = "local"
 
 
 class Destination(ConfigurableResource):

@@ -11,22 +11,22 @@ from dagster import AssetExecutionContext, asset
 from sqlalchemy import select
 
 from stock_pipeline.core.db import PostgresResource
-from stock_pipeline.core.destinations.base import DEFAULT_STORAGE, TAG_STORAGE
 from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.models import Instrument
 from stock_pipeline.core.partitions import equity_symbols
 from stock_pipeline.core.sources.csv_source import CsvSource
 from stock_pipeline.core.sources.kite import KiteSource
+from stock_pipeline.core.tags import (
+    DEFAULT_SOURCE,
+    DEFAULT_START_DATE,
+    DEFAULT_STORAGE,
+    TAG_END_DATE,
+    TAG_SOURCE,
+    TAG_START_DATE,
+    TAG_STORAGE,
+)
 
-GROUP = "daily_eod"
-
-# Run tags override these — set via Launchpad or Backfill dialog.
-TAG_SOURCE = "source"
-TAG_START_DATE = "start_date"
-TAG_END_DATE = "end_date"
-
-DEFAULT_SOURCE = "kite"
-DEFAULT_START_DATE = "2000-01-01"
+GROUP = "daily_eq"
 
 # Whitelist grows as more Destination impls land (s3, drive_local, ...).
 _VALID_STORAGES = ("local",)

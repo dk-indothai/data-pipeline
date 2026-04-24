@@ -4,11 +4,7 @@ dialog's Tags section."""
 
 from dagster import AssetSelection, define_asset_job
 
-from stock_pipeline.daily_eq.assets import (
-    TAG_END_DATE,
-    TAG_SOURCE,
-    TAG_START_DATE,
-)
+from stock_pipeline.core.tags import TAG_END_DATE, TAG_SOURCE, TAG_START_DATE
 
 _SELECTION = AssetSelection.keys("raw_daily", "processed_daily", "daily_parquet")
 
