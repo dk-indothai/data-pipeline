@@ -48,13 +48,10 @@ _BATCH_PER_TICK = 2000
 )
 def option_contracts_sync(context: SensorEvaluationContext, db: PostgresResource):
     query = (
-        select(Instrument.tradingsymbol)
-        .where(Instrument.segment.in_(("NFO-OPT", "BFO-OPT")))
+        select(Instrument.name)
+        .where(Instrument.segment == "NFO-OPT")
         .where(Instrument.instrument_type.in_(("CE", "PE")))
-        .where(Instrument.name.in_(TRACKED_UNDERLYINGS))
-        .where(Instrument.expiry >= date.today())
-        .where(Instrument.tradingsymbol.is_not(None))
-        .order_by(Instrument.tradingsymbol)
+        .where(Instrument.name.is_not(None))
     )
     if IS_DEV:
         query = query.limit(DEV_CONTRACT_LIMIT)

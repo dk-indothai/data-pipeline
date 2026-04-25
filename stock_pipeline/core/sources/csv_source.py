@@ -18,6 +18,7 @@ Intraday methods preserve the full timestamp as an ISO datetime string.
 
 Return shape matches KiteSource so call sites don't branch on source type.
 """
+
 from datetime import date
 from pathlib import Path
 
@@ -29,13 +30,17 @@ from dagster import ConfigurableResource, get_dagster_logger
 # lowercase-schema files too. Extra columns (Symbol, Strike, ...) get dropped
 # when the method projects to the final column list.
 _OP_COLUMN_NORMALIZE = {
-    "DateTime": "date",
+    "DateTime": "datetime",
     "Open": "open",
     "High": "high",
     "Low": "low",
     "Close": "close",
     "Volume": "volume",
     "Open Interest": "oi",
+    "Strike": "strike",
+    "Expiry": "expiry",
+    "OptionType": "option_type",
+    "lot size": "lot_size",
 }
 
 
@@ -50,9 +55,7 @@ class CsvSource(ConfigurableResource):
     def _path(self, bucket: str, symbol: str) -> Path:
         return Path(self.root_dir) / "daily" / bucket / f"{symbol}.csv"
 
-    def _fetch(
-        self, symbol: str, on: date, bucket: str, with_oi: bool
-    ) -> pd.DataFrame:
+    def _fetch(self, symbol: str, on: date, bucket: str, with_oi: bool) -> pd.DataFrame:
         path = self._path(bucket, symbol)
         log = get_dagster_logger()
         if not path.exists():
@@ -156,19 +159,20 @@ class CsvSource(ConfigurableResource):
             return pd.DataFrame()
 
         df = pd.read_csv(path)
-        # Legacy option CSVs ship with the output-schema casing (DateTime,
-        # Open, ...). Normalize to the lowercase raw schema the asset/DB-
-        # enrichment stage expects; a no-op for already-lowercase files.
+        # Option CSVs ship with the output-schema casing (DateTime, Open, ...).
+        # Normalize to the lowercase raw schema the asset stage expects.
         df = df.rename(columns=_OP_COLUMN_NORMALIZE)
-        if "date" not in df.columns:
+        if "datetime" not in df.columns:
             log.warning(
-                f"CsvSource: {path} missing `date`/`DateTime` column "
+                f"CsvSource: {path} missing `datetime`/`DateTime` column "
                 f"(found: {list(df.columns)})"
             )
             return pd.DataFrame()
 
-        df["date"] = pd.to_datetime(df["date"], utc=False, format="mixed")
-        mask = (df["date"].dt.date >= from_date) & (df["date"].dt.date <= to_date)
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=False, format="mixed")
+        mask = (df["datetime"].dt.date >= from_date) & (
+            df["datetime"].dt.date <= to_date
+        )
         df = df.loc[mask].copy()
         if df.empty:
             log.warning(
@@ -176,10 +180,20 @@ class CsvSource(ConfigurableResource):
             )
             return pd.DataFrame()
 
-        df["date"] = df["date"].astype(str)
-        cols = ["date", "open", "high", "low", "close", "volume"]
-        if "oi" in df.columns:
-            cols.append("oi")
+        df["datetime"] = df["datetime"].astype(str)
+
+        # Normalize expiry to YYYY-MM-DD so parquet round-trips cleanly across
+        # re-runs. Rows where parsing fails keep their original string value.
+        if "expiry" in df.columns:
+            parsed = pd.to_datetime(df["expiry"], errors="coerce", format="mixed")
+            df["expiry"] = parsed.dt.strftime("%Y-%m-%d").fillna(
+                df["expiry"].astype(str)
+            )
+
+        cols = ["datetime", "open", "high", "low", "close", "volume"]
+        for opt in ("oi", "strike", "expiry", "option_type", "lot_size"):
+            if opt in df.columns:
+                cols.append(opt)
         return df[cols]
 
     def fetch_daily_fut(
