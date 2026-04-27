@@ -42,26 +42,10 @@ _VALID_STORAGES = ("local",)
 # is too wide and would iterate ~15 years of weekends for nothing.
 DEFAULT_INTRADAY_START_DATE = "2015-02-02"
 
-# Column carrying the trading day; added to the raw frame so downstream assets
-# don't need to re-parse the minute-level timestamp to group by date.
-TRADING_DATE_COL = "trading_date"
-
-
-def _resolve_tags(tags: dict[str, str]) -> tuple[str, date_cls, date_cls]:
-    """Pull (source, start_date, end_date) from run tags, with defaults."""
-    source = tags.get(TAG_SOURCE, DEFAULT_SOURCE)
-    if source not in ("kite", "csv"):
-        raise ValueError(
-            f"tag '{TAG_SOURCE}'='{source}' invalid — must be 'kite' or 'csv'"
-        )
-    start = date_cls.fromisoformat(
-        tags.get(TAG_START_DATE, DEFAULT_INTRADAY_START_DATE)
-    )
-    end_tag = tags.get(TAG_END_DATE)
-    end = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
-    if end < start:
-        raise ValueError(f"end_date {end} < start_date {start}")
-    return source, start, end
+# Helper column carrying the trading day; added in raw, read in the write
+# asset for path routing, dropped before parquet serialization. Underscore
+# prefix matches daily_op's `_underlying`/`_contract` convention.
+_TRADING_DATE_COL = "_trading_date"
 
 
 @asset(partitions_def=equity_symbols, group_name=GROUP)
@@ -72,7 +56,21 @@ def raw_intraday(
     db: PostgresResource,
 ) -> pd.DataFrame:
     symbol = context.partition_key
-    source, start, end = _resolve_tags(context.run.tags)
+    tags = context.run.tags
+
+    source = tags.get(TAG_SOURCE, DEFAULT_SOURCE)
+    if source not in ("kite", "csv"):
+        raise ValueError(
+            f"tag '{TAG_SOURCE}'='{source}' invalid — must be 'kite' or 'csv'"
+        )
+
+    from_date = date_cls.fromisoformat(
+        tags.get(TAG_START_DATE, DEFAULT_INTRADAY_START_DATE)
+    )
+    end_tag = tags.get(TAG_END_DATE)
+    to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
+    if to_date < from_date:
+        raise ValueError(f"end_date {to_date} < start_date {from_date}")
 
     # Kite's historical API requires instrument_token, not tradingsymbol.
     with db.session() as s:
@@ -85,27 +83,28 @@ def raw_intraday(
 
     if token is None:
         raise ValueError(
-            f"{symbol} not found in instruments as NSE/EQ — "
+            f"{symbol} not found in instruments as NSE/EQ tradingsymbol — "
             f"check the sensor or the universe filter."
         )
 
-    # Both sources expose the same fetch_intraday_eq_range signature (duck-
-    # typed via core/sources/base.py protocol); one range call, then the
-    # terminal asset splits by trading date at write time.
     src = kite if source == "kite" else csv
     context.log.info(
-        f"Fetching intraday {symbol} (token={token}) [{start}, {end}] via {source}"
+        f"Fetching intraday {symbol} (token={token}) "
+        f"[{from_date}, {to_date}] via {source}"
     )
     df = src.fetch_intraday_eq_range(
-        symbol=symbol, instrument_token=token, from_date=start, to_date=end
+        symbol=symbol,
+        instrument_token=token,
+        from_date=from_date,
+        to_date=to_date,
     )
     if df.empty:
-        context.log.warning(f"No intraday data for {symbol} in [{start}, {end}]")
+        context.log.warning(f"No intraday data for {symbol} in [{from_date}, {to_date}]")
         return df
 
     # First 10 chars of the ISO timestamp are the YYYY-MM-DD slot — avoids
     # reparsing the full datetime on a multi-million-row frame.
-    df[TRADING_DATE_COL] = df["date"].str[:10]
+    df[_TRADING_DATE_COL] = df["date"].str[:10]
     return df
 
 
@@ -143,9 +142,9 @@ def intraday_parquet(
     # Split by trading_date and write one parquet per day. Writes overwrite
     # atomically — re-materializing a range refreshes every file in scope.
     written = 0
-    for trading_date, group in processed_intraday.groupby(TRADING_DATE_COL):
+    for trading_date, group in processed_intraday.groupby(_TRADING_DATE_COL):
         rel = f"intraday/eq/{symbol}/{trading_date}.parquet"
-        dest.write(group.drop(columns=[TRADING_DATE_COL]), rel)
+        dest.write(group.drop(columns=[_TRADING_DATE_COL]), rel)
         context.log.info(f"Wrote {rel} ({len(group)} rows)")
         written += 1
 
