@@ -7,6 +7,7 @@ Reads pre-downloaded OHLCV from a directory laid out as:
     {root_dir}/daily/call/{SYMBOL}.csv
     {root_dir}/daily/put/{SYMBOL}.csv
     {root_dir}/intraday/eq/{SYMBOL}.csv
+    {root_dir}/intraday/op/{UNDERLYING}.csv  (multi-contract, fan out by Ticker)
 
 CSV schema: `date,open,high,low,close,volume` (plus `oi` when present).
 `date` is parsed leniently — the timestamp's calendar date is matched
@@ -23,6 +24,9 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.csv as pacsv
 from dagster import ConfigurableResource, get_dagster_logger
 
 # Rename map for legacy option CSVs that use the public output-schema casing
@@ -41,6 +45,10 @@ _OP_COLUMN_NORMALIZE = {
     "Expiry": "expiry",
     "OptionType": "option_type",
     "lot size": "lot_size",
+    # Ticker holds the contract trading symbol (e.g. BANKNIFTY24D1910000CE)
+    # in multi-contract intraday CSVs. daily_op's per-contract files don't
+    # need it (filename is the contract) and project it out anyway.
+    "Ticker": "contract",
 }
 
 
@@ -191,6 +199,117 @@ class CsvSource(ConfigurableResource):
             )
 
         cols = ["datetime", "open", "high", "low", "close", "volume"]
+        for opt in ("oi", "strike", "expiry", "option_type", "lot_size"):
+            if opt in df.columns:
+                cols.append(opt)
+        return df[cols]
+
+    def fetch_intraday_op_range(
+        self,
+        underlying: str,
+        from_date: date,
+        to_date: date,
+    ) -> pd.DataFrame:
+        # Layout: {root}/intraday/op/{UNDERLYING}.csv. One file per
+        # underlying carrying every contract's minute candles — the asset
+        # fans out by `contract` at write time.
+        #
+        # These files run into multiple GB. `pd.read_csv` would load and
+        # type-infer the whole thing before we filter, blowing both RAM
+        # and wall time. We stream batches through pyarrow's CSV reader
+        # and apply the date filter as a cheap prefix comparison on the
+        # raw `DateTime` string (the ISO format `YYYY-MM-DD HH:MM:SS` is
+        # lexicographically ordered on its first 10 chars), so RAM peak
+        # scales with the matching slice — not the file.
+        path = Path(self.root_dir) / "intraday" / "op" / f"{underlying}.csv"
+        log = get_dagster_logger()
+        if not path.exists():
+            log.warning(f"CsvSource: no file at {path} for {underlying}")
+            return pd.DataFrame()
+
+        from_str = from_date.isoformat()
+        to_str = to_date.isoformat()
+        # - DateTime: string so the per-batch filter is a prefix compare
+        #   (no timestamp parsing on rejected rows).
+        # - Numeric columns: float64 explicitly. Pyarrow infers per-batch;
+        #   if the first batch happens to be all-int (e.g. lot size = 50)
+        #   it locks int64, then a later `25.0` blows up the read. Float
+        #   handles both shapes uniformly.
+        convert_opts = pacsv.ConvertOptions(
+            column_types={
+                "DateTime": pa.string(),
+                "Strike": pa.float64(),
+                "Open": pa.float64(),
+                "High": pa.float64(),
+                "Low": pa.float64(),
+                "Close": pa.float64(),
+                "Volume": pa.float64(),
+                "Open Interest": pa.float64(),
+                "lot size": pa.float64(),
+            },
+        )
+
+        matching: list[pa.RecordBatch] = []
+        with pacsv.open_csv(str(path), convert_options=convert_opts) as reader:
+            schema_names = reader.schema.names
+            if "DateTime" not in schema_names:
+                log.warning(
+                    f"CsvSource: {path} missing `DateTime` column "
+                    f"(found: {schema_names})"
+                )
+                return pd.DataFrame()
+            if "Ticker" not in schema_names:
+                log.warning(
+                    f"CsvSource: {path} missing `Ticker` column "
+                    f"(found: {schema_names}) — cannot fan out by contract"
+                )
+                return pd.DataFrame()
+            for batch in reader:
+                date_part = pc.utf8_slice_codeunits(batch.column("DateTime"), 0, 10)
+                mask = pc.and_(
+                    pc.greater_equal(date_part, pa.scalar(from_str)),
+                    pc.less_equal(date_part, pa.scalar(to_str)),
+                )
+                kept = batch.filter(mask)
+                if kept.num_rows:
+                    matching.append(kept)
+
+        if not matching:
+            log.warning(
+                f"CsvSource: no intraday op rows for {underlying} "
+                f"in [{from_date}, {to_date}]"
+            )
+            return pd.DataFrame()
+
+        df = pa.Table.from_batches(matching).to_pandas()
+        df = df.rename(columns=_OP_COLUMN_NORMALIZE)
+        # Already filtered + already string; no re-parse needed.
+        df["datetime"] = df["datetime"].astype(str)
+
+        if "expiry" in df.columns:
+            parsed = pd.to_datetime(df["expiry"], errors="coerce", format="mixed")
+            df["expiry"] = parsed.dt.strftime("%Y-%m-%d").fillna(
+                df["expiry"].astype(str)
+            )
+
+        # Override the Ticker-derived `contract` with the daily_op naming
+        # convention: {UNDERLYING}_{STRIKE}_{TYPE}_{DD}_{MON}_{YY}. Uses
+        # the function arg `underlying` (single value per call) rather
+        # than the CSV's `Symbol` column, so a stray row with a wrong
+        # Symbol can't corrupt the filename.
+        if {"strike", "expiry", "option_type"}.issubset(df.columns):
+            exp_dt = pd.to_datetime(df["expiry"], format="%Y-%m-%d", errors="coerce")
+            strike_int = df["strike"].astype(float).astype("Int64").astype(str)
+            df["contract"] = (
+                underlying
+                + "_" + strike_int
+                + "_" + df["option_type"].astype(str)
+                + "_" + exp_dt.dt.day.map("{:02d}".format)
+                + "_" + exp_dt.dt.strftime("%b").str.upper()
+                + "_" + exp_dt.dt.year.mod(100).map("{:02d}".format)
+            )
+
+        cols = ["datetime", "contract", "open", "high", "low", "close", "volume"]
         for opt in ("oi", "strike", "expiry", "option_type", "lot_size"):
             if opt in df.columns:
                 cols.append(opt)
