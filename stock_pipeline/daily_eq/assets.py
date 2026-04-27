@@ -53,6 +53,9 @@ def raw_daily(
     to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
 
     # Kite's historical API requires instrument_token, not tradingsymbol.
+    # Partition key is `SymphonyInstruments.name` (sensor source), which
+    # corresponds to `Instrument.tradingsymbol` on the Kite side — not
+    # `Instrument.name` (that's the company name, e.g. "HDFC BANK").
     with db.session() as s:
         token = s.execute(
             select(Instrument.instrument_token)
@@ -63,7 +66,7 @@ def raw_daily(
 
     if token is None:
         raise ValueError(
-            f"{symbol} not found in instruments as NSE/EQ — "
+            f"{symbol} not found in instruments as NSE/EQ tradingsymbol — "
             f"check the sensor or the universe filter."
         )
 

@@ -92,3 +92,11 @@ Replace with a query against a dedicated table (`active_equity`,
 ### Format
 - Parquet
 - Lean Compatiable
+
+
+Fully paid equity shares/ETF's
+Fully paid equity shares SME
+Partly paid equity shares
+Fully convertible preference shares
+Fully convertible debt instruments
+Convertible warrants

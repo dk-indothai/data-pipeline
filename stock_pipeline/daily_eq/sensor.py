@@ -18,7 +18,7 @@ from dagster import (
 from sqlalchemy import select
 
 from stock_pipeline.core.db import PostgresResource
-from stock_pipeline.core.models import Instrument
+from stock_pipeline.core.models import Instrument, SymphonyInstruments
 from stock_pipeline.core.partitions import equity_symbols
 
 IS_DEV = os.getenv("ENV", "prod").lower() == "dev"
@@ -32,11 +32,14 @@ DEV_SYMBOL_LIMIT = 5
 )
 def equity_symbols_sync(context: SensorEvaluationContext, db: PostgresResource):
     query = (
-        select(Instrument.tradingsymbol)
-        .where(Instrument.exchange == "NSE")
+        select(SymphonyInstruments.name)
+        .join(
+            Instrument,
+            Instrument.exchange_token == SymphonyInstruments.scrip_code,
+        )
+        .where(Instrument.segment == "NSE")
         .where(Instrument.instrument_type == "EQ")
-        .where(Instrument.tradingsymbol.is_not(None))
-        .order_by(Instrument.tradingsymbol)
+        .where(SymphonyInstruments.name.is_not(None))
     )
     if IS_DEV:
         query = query.limit(DEV_SYMBOL_LIMIT)

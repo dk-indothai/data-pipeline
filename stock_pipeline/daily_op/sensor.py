@@ -17,7 +17,7 @@ from dagster import (
 from sqlalchemy import select
 
 from stock_pipeline.core.db import PostgresResource
-from stock_pipeline.core.models import Instrument
+from stock_pipeline.core.models import Instrument, SymphonyInstruments
 from stock_pipeline.core.partitions import option_contracts
 
 IS_DEV = os.getenv("ENV", "prod").lower() == "dev"
@@ -47,11 +47,17 @@ _BATCH_PER_TICK = 2000
     default_status=DefaultSensorStatus.RUNNING,
 )
 def option_contracts_sync(context: SensorEvaluationContext, db: PostgresResource):
+    # Inner-join Symphony so the universe is constrained to instruments
+    # that exist on both Kite (instruments) and Symphony — link is
+    # Instrument.exchange_token == SymphonyInstruments.scrip_code.
     query = (
-        select(Instrument.name)
-        .where(Instrument.segment == "NFO-OPT")
-        .where(Instrument.instrument_type.in_(("CE", "PE")))
-        .where(Instrument.name.is_not(None))
+        select(SymphonyInstruments.name)
+        .join(
+            Instrument,
+            Instrument.exchange_token == SymphonyInstruments.scrip_code,
+        )
+        .where(Instrument.segment.in_(("NSE", "NFO-OPT")))
+        .where(SymphonyInstruments.name.is_not(None))
     )
     if IS_DEV:
         query = query.limit(DEV_CONTRACT_LIMIT)
