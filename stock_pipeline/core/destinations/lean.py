@@ -1,27 +1,31 @@
-"""QuantConnect LEAN destination for minute option data.
+"""QuantConnect LEAN destination for option-minute and equity-daily data.
 
-Emits the on-disk shape LEAN expects for an option backtest:
+Emits the on-disk shapes LEAN expects:
 
+    # Minute options (write_minute_option_day)
     {base_dir}/option/{country}/minute/{symbol}/
         {YYYYMMDD}_trade_{style}.zip          (inner: per-contract CSVs)
         {YYYYMMDD}_openinterest_{style}.zip
     {base_dir}/option/{country}/universes/{symbol}/
         {YYYYMMDD}.csv
 
-LEAN's grouping is per-(date, tick_type) — one zip per trading day
-carrying every contract — so the per-file `write(df, rel_path)`
-primitive that LocalStorage uses doesn't fit. This class adds a
-higher-level emitter, `write_minute_option_day`, that takes one day's
-multi-contract DataFrame in the natural pipeline shape and produces the
-trade zip + OI zip + universe CSV.
+    # Daily equity (write_daily_equity)
+    {base_dir}/equity/{country}/daily/{symbol}.zip
+        {symbol}.csv                          (one line per day, no header)
 
-Reusable: any flow producing a minute-bar option DataFrame with the
-columns documented on `write_minute_option_day` can route output here
-by selecting `storage=lean`.
+The two resolutions live on the same class so any pipeline group can
+take `lean: LeanStorage` as a resource and dispatch on a `storage=lean`
+run tag — the right emitter is just a method call away.
+
+Higher-level emitters (`write_minute_option_day`, `write_daily_equity`)
+exist instead of the per-file `write(df, rel_path)` primitive that
+`LocalStorage` uses, because LEAN's groupings (per-date for options,
+per-symbol-with-merge for equity) don't fit one-DataFrame-per-path.
 
 Conversion logic (deci-cent prices, time_ms, contract filename
 encoding, universe row layout) follows the reference notebook
-`csv_to_lean.ipynb` at repo root.
+`csv_to_lean.ipynb` at repo root; daily-equity encoding follows
+`daily_equity_transformer.py`.
 """
 
 import io
@@ -156,6 +160,69 @@ class LeanStorage(Destination):
         written += 1
 
         return written
+
+    def write_daily_equity(
+        self,
+        df: pd.DataFrame,
+        *,
+        symbol: str,
+    ) -> int:
+        """Emit one symbol's full daily history in LEAN equity format.
+
+        Args:
+            df: rows with columns `date` ("YYYY-MM-DD"), `open`,
+                `high`, `low`, `close`, `volume`. Extra columns are
+                ignored.
+            symbol: e.g. "RELIANCE". Lowercased for the LEAN path.
+
+        Behavior: read-modify-write. If `{symbol}.zip` already exists
+        at the target path, the existing inner CSV is parsed back into
+        a frame and merged with `df`; rows are deduped by `date`
+        (incoming wins) and sorted ascending before rewrite. This
+        matches the parquet-side merge semantics of `daily_eq`'s local
+        path so a narrow re-run never destroys old history.
+
+        Returns: 1 on successful write, 0 if the merged frame is empty.
+        """
+        log = get_dagster_logger()
+        sym = symbol.lower()
+        out_dir = Path(self.base_dir) / "equity" / self.country / "daily"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        zpath = out_dir / f"{sym}.zip"
+        inner_name = f"{sym}.csv"
+
+        incoming = self._normalize_daily_eq(df)
+        existing = self._read_daily_equity_zip(zpath, inner_name)
+
+        if existing is not None and not existing.empty:
+            merged = pd.concat([existing, incoming], ignore_index=True)
+            # `keep="last"` → incoming row wins on `date` overlap.
+            merged = merged.drop_duplicates(subset=["date"], keep="last")
+            merged = merged.sort_values("date").reset_index(drop=True)
+        else:
+            merged = incoming.sort_values("date").reset_index(drop=True)
+
+        if merged.empty:
+            log.warning(
+                f"LeanStorage: nothing to write for {symbol} "
+                f"(empty incoming frame and no existing zip)"
+            )
+            return 0
+
+        buf = io.StringIO()
+        for r in merged.itertuples(index=False):
+            date_compact = str(r.date).replace("-", "")
+            o = int(round(float(r.open) * _DECI_CENT_MULTIPLIER))
+            h = int(round(float(r.high) * _DECI_CENT_MULTIPLIER))
+            l = int(round(float(r.low) * _DECI_CENT_MULTIPLIER))
+            c = int(round(float(r.close) * _DECI_CENT_MULTIPLIER))
+            v = int(float(r.volume))
+            buf.write(f"{date_compact} 00:00,{o},{h},{l},{c},{v}\n")
+
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(inner_name, buf.getvalue())
+
+        return 1
 
     # ------------------------------------------------------------------
     # Internals
@@ -307,3 +374,67 @@ class LeanStorage(Destination):
         if pd.isna(val):
             return ""
         return f"{int(val) / _DECI_CENT_MULTIPLIER:.4f}"
+
+    @staticmethod
+    def _normalize_daily_eq(df: pd.DataFrame) -> pd.DataFrame:
+        """Project to the daily-equity columns and force `date` to ISO str.
+
+        Drops everything except `date,open,high,low,close,volume`. Any
+        missing required column raises — these are bugs in the upstream
+        asset, not data quality issues to swallow.
+        """
+        if df.empty:
+            return df.iloc[0:0][[]]
+        required = ["date", "open", "high", "low", "close", "volume"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"LeanStorage.write_daily_equity: missing columns {missing}; "
+                f"got {list(df.columns)}"
+            )
+        out = df[required].copy()
+        out["date"] = out["date"].astype(str)
+        return out
+
+    @staticmethod
+    def _read_daily_equity_zip(
+        zpath: Path, inner_name: str
+    ) -> pd.DataFrame | None:
+        """Decode an existing LEAN daily-equity zip back into a frame.
+
+        Returns None if the zip doesn't exist; an empty frame if the
+        inner CSV is empty. Encoded prices are divided back by the
+        deci-cent multiplier so the merge step works in the same units
+        as the incoming frame.
+        """
+        if not zpath.exists():
+            return None
+        with zipfile.ZipFile(zpath, "r") as zf:
+            try:
+                raw = zf.read(inner_name).decode()
+            except KeyError:
+                return None
+        if not raw.strip():
+            return pd.DataFrame(
+                columns=["date", "open", "high", "low", "close", "volume"]
+            )
+        rows = []
+        for line in raw.splitlines():
+            # Format: "YYYYMMDD 00:00,o,h,l,c,v" — split on "," and the
+            # leading " " is part of the date field.
+            parts = line.split(",")
+            if len(parts) != 6:
+                continue
+            date_compact = parts[0].split(" ", 1)[0]
+            iso = f"{date_compact[0:4]}-{date_compact[4:6]}-{date_compact[6:8]}"
+            rows.append(
+                {
+                    "date": iso,
+                    "open": int(parts[1]) / _DECI_CENT_MULTIPLIER,
+                    "high": int(parts[2]) / _DECI_CENT_MULTIPLIER,
+                    "low": int(parts[3]) / _DECI_CENT_MULTIPLIER,
+                    "close": int(parts[4]) / _DECI_CENT_MULTIPLIER,
+                    "volume": int(parts[5]),
+                }
+            )
+        return pd.DataFrame(rows)

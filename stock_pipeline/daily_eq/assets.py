@@ -1,7 +1,12 @@
-"""Daily EOD pipeline: fetch -> process -> write parquet.
+"""Daily EOD pipeline: fetch -> process -> write.
 
 Partition: (date x equity_symbol). The equity_symbol pool is synced from
 the shared `instruments` table by daily_eod.sensor.
+
+Storage tags:
+  storage = local   →  data/daily/eq/{symbol}.parquet  (read-modify-write)
+  storage = lean    →  lean_data/equity/{country}/daily/{symbol}.zip
+                       (read-modify-write; LEAN-encoded daily bars)
 """
 
 from datetime import date as date_cls
@@ -11,6 +16,7 @@ from dagster import AssetExecutionContext, asset
 from sqlalchemy import select
 
 from stock_pipeline.core.db import PostgresResource
+from stock_pipeline.core.destinations.lean import LeanStorage
 from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.models import Instrument
 from stock_pipeline.core.partitions import equity_symbols
@@ -29,7 +35,7 @@ from stock_pipeline.core.tags import (
 GROUP = "daily_eq"
 
 # Whitelist grows as more Destination impls land (s3, drive_local, ...).
-_VALID_STORAGES = ("local",)
+_VALID_STORAGES = ("local", "lean")
 
 
 @asset(partitions_def=equity_symbols, group_name=GROUP)
@@ -96,6 +102,7 @@ def daily_parquet(
     context: AssetExecutionContext,
     processed_daily: pd.DataFrame,
     local: LocalStorage,
+    lean: LeanStorage,
 ) -> None:
     if processed_daily.empty:
         context.log.warning("Empty DataFrame — skipping write")
@@ -106,19 +113,28 @@ def daily_parquet(
         raise ValueError(
             f"tag '{TAG_STORAGE}'='{storage}' invalid — must be one of {_VALID_STORAGES}"
         )
-    dest = local  # only local impl today; dispatch grows when S3/Drive land.
 
     symbol = context.partition_key
-    rel = f"daily/eq/{symbol}.parquet"
 
-    # Merge + dedupe by date. Read-modify-write pattern because one parquet
-    # per symbol holds the full history — each run contributes new rows.
-    existing = dest.read(rel)
+    if storage == "lean":
+        # LeanStorage owns its own read-modify-write merge against the
+        # existing zip, so this branch stays tight.
+        n = lean.write_daily_equity(processed_daily, symbol=symbol)
+        context.log.info(
+            f"LEAN: wrote {n} file(s) for {symbol} via storage={storage}"
+        )
+        return
+
+    # storage == "local": one parquet per symbol holds full history;
+    # merge + dedupe by date so each run contributes new rows without
+    # losing old ones.
+    rel = f"daily/eq/{symbol}.parquet"
+    existing = local.read(rel)
     if not existing.empty:
         combined = pd.concat([existing, processed_daily], ignore_index=True)
         combined = combined.drop_duplicates(subset=["date"], keep="last")
         combined = combined.sort_values("date").reset_index(drop=True)
     else:
         combined = processed_daily
-    dest.write(combined, rel)
+    local.write(combined, rel)
     context.log.info(f"Wrote {rel} ({len(combined)} rows) via storage={storage}")
