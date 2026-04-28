@@ -6,3 +6,4 @@ data/
 .env
 *.db
 old_data/
+lean_data/

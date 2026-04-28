@@ -5,6 +5,7 @@ import os
 from dagster import Definitions, EnvVar, load_assets_from_modules
 
 from stock_pipeline.core.db import PostgresResource
+from stock_pipeline.core.destinations.lean import LeanStorage
 from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.sources.csv_source import CsvSource
 from stock_pipeline.core.sources.kite import KiteSource
@@ -37,6 +38,11 @@ defs = Definitions(
         ),
         "csv": CsvSource(root_dir=os.getenv("CSV_ROOT_DIR", "CustomSource")),
         "local": LocalStorage(base_dir=os.getenv("LOCAL_STORAGE_DIR", "data")),
+        "lean": LeanStorage(
+            base_dir=os.getenv("LEAN_STORAGE_DIR", "lean_data"),
+            country=os.getenv("LEAN_COUNTRY", "india"),
+            option_style=os.getenv("LEAN_OPTION_STYLE", "american"),
+        ),
         "db": PostgresResource(url=EnvVar("DATABASE_URL")),
     },
 )

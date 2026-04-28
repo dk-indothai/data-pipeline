@@ -100,3 +100,13 @@ Partly paid equity shares
 Fully convertible preference shares
 Fully convertible debt instruments
 Convertible warrants
+
+
+### IMPLEMENTED
+- source: csv, storage: local
+  - daily_op 
+  - daily_eq
+  - intraday_op
+  - intraday_eq
+- source: csv, storage: lean
+  - intraday_op

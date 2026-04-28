@@ -14,7 +14,7 @@ Tags:
   source        "kite" | "csv"          default: kite  (kite is no-op for now)
   start_date    YYYY-MM-DD              default: 2015-02-02 (earliest CSV)
   end_date      YYYY-MM-DD              default: today
-  storage       "local"                 default: local
+  storage       "local" | "lean"        default: local
 """
 
 from datetime import date as date_cls
@@ -22,6 +22,7 @@ from datetime import date as date_cls
 import pandas as pd
 from dagster import AssetExecutionContext, asset
 
+from stock_pipeline.core.destinations.lean import LeanStorage
 from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.partitions import option_contracts
 from stock_pipeline.core.sources.csv_source import CsvSource
@@ -38,7 +39,7 @@ from stock_pipeline.core.tags import (
 GROUP = "intraday_op"
 
 # Whitelist grows as more Destination impls land (s3, drive_local, ...).
-_VALID_STORAGES = ("local",)
+_VALID_STORAGES = ("local", "lean")
 
 # Earliest date present in the intraday CSV corpus; the universal default
 # of 2000-01-01 would scan years of empty range for nothing.
@@ -87,9 +88,7 @@ def raw_intraday_op(
         underlying=underlying, from_date=from_date, to_date=to_date
     )
     if df.empty:
-        context.log.warning(
-            f"no rows for {underlying} in [{from_date}, {to_date}]"
-        )
+        context.log.warning(f"no rows for {underlying} in [{from_date}, {to_date}]")
         return df
 
     df[_UNDERLYING_COL] = underlying
@@ -122,6 +121,7 @@ def intraday_op_parquet(
     context: AssetExecutionContext,
     processed_intraday_op: pd.DataFrame,
     local: LocalStorage,
+    lean: LeanStorage,
 ) -> None:
     if processed_intraday_op.empty:
         context.log.warning("Empty DataFrame — skipping write")
@@ -132,13 +132,35 @@ def intraday_op_parquet(
         raise ValueError(
             f"tag '{TAG_STORAGE}'='{storage}' invalid — must be one of {_VALID_STORAGES}"
         )
-    dest = local
 
     underlying = processed_intraday_op[_UNDERLYING_COL].iloc[0]
 
-    # Fan out: one parquet per (contract, trading_date) under this
-    # underlying. Writes overwrite atomically — re-materializing a range
-    # refreshes every file in scope without merge/dedupe overhead.
+    if storage == "lean":
+        # LEAN groups by (date, tick_type) — one zip per trading day
+        # carrying all contracts. Fan out by trading_date and let
+        # LeanStorage own the encoding.
+        written = 0
+        for trading_date, day_df in processed_intraday_op.groupby(
+            _TRADING_DATE_COL, sort=False
+        ):
+            n = lean.write_minute_option_day(
+                day_df.drop(columns=[_UNDERLYING_COL, _TRADING_DATE_COL]),
+                underlying=underlying,
+                date_str=trading_date,
+            )
+            context.log.info(
+                f"LEAN: wrote {n} file(s) for {underlying} on {trading_date}"
+            )
+            written += n
+        context.log.info(
+            f"{underlying}: wrote {written} LEAN files via storage={storage}"
+        )
+        return
+
+    # storage == "local": one parquet per (contract, trading_date) under
+    # this underlying. Writes overwrite atomically — re-materializing a
+    # range refreshes every file in scope without merge/dedupe overhead.
+    dest = local
     written = 0
     for (contract, trading_date), group in processed_intraday_op.groupby(
         [_CONTRACT_COL, _TRADING_DATE_COL], sort=False
