@@ -54,6 +54,12 @@ def raw_daily(
             f"tag '{TAG_SOURCE}'='{source}' invalid — must be 'kite' or 'csv'"
         )
 
+    if source == "kite":
+        context.log.info(
+            f"source=kite for {symbol} — skipping (not implemented for daily eq)"
+        )
+        return pd.DataFrame()
+
     from_date = date_cls.fromisoformat(tags.get(TAG_START_DATE, DEFAULT_START_DATE))
     end_tag = tags.get(TAG_END_DATE)
     to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
@@ -76,11 +82,10 @@ def raw_daily(
             f"check the sensor or the universe filter."
         )
 
-    src = kite if source == "kite" else csv
     context.log.info(
-        f"Fetching {symbol} (token={token}) for [{from_date}, {to_date}] via {source}"
+        f"Fetching {symbol} (token={token}) for [{from_date}, {to_date}] via csv"
     )
-    return src.fetch_daily_eq_range(
+    return csv.fetch_daily_eq_range(
         symbol=symbol, instrument_token=token, from_date=from_date, to_date=to_date
     )
 

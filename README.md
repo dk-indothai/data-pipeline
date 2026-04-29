@@ -109,4 +109,7 @@ Convertible warrants
   - intraday_op
   - intraday_eq
 - source: csv, storage: lean
+  - daily_eq
+  - daily_op `PENDING`
+  - intraday_eq `PENDING`
   - intraday_op
