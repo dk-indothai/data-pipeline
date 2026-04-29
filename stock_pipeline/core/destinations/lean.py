@@ -224,6 +224,65 @@ class LeanStorage(Destination):
 
         return 1
 
+    def write_daily_option(
+        self,
+        df: pd.DataFrame,
+        *,
+        underlying: str,
+    ) -> int:
+        """Emit one underlying's daily option history in LEAN format.
+
+        Args:
+            df: per-(contract, date) rows. Required columns:
+                `datetime` (ISO "YYYY-MM-DD ..." or "YYYY-MM-DD"),
+                `open`, `high`, `low`, `close`, `volume`, `strike`,
+                `expiry` ("YYYY-MM-DD"), `option_type` ("CE"/"PE").
+                Optional: `oi`. Extra columns are ignored.
+            underlying: e.g. "NIFTY". Lowercased for the LEAN path.
+
+        Layout (verified against Lean/Data/option/usa/daily/):
+            {base}/option/{country}/daily/
+                {ul}_{YYYY}_trade_{style}.zip
+                {ul}_{YYYY}_openinterest_{style}.zip
+            Inner entry per contract:
+                {ul}_trade_{style}_{call|put}_{strikeDeci}_{expiryYYYYMMDD}.csv
+
+        Behavior: read-modify-write per (underlying, year) zip.
+        Existing rows are decoded and merged with incoming by
+        `(entry_name, date)` — incoming wins. Years not present in
+        `df` are not touched.
+
+        Returns: number of zip files written across all touched
+        years (trade + OI; OI is skipped when no positive-OI rows
+        landed in that year).
+        """
+        if df.empty:
+            return 0
+
+        log = get_dagster_logger()
+        prepared = self._prepare_daily_op(df)
+        if prepared.empty:
+            log.warning(
+                f"LeanStorage: no usable rows for {underlying} after "
+                f"derivation (missing strike/expiry/option_type, or "
+                f"no row mapped to a valid CE/PE)"
+            )
+            return 0
+
+        ul = underlying.lower()
+        out_dir = Path(self.base_dir) / "option" / self.country / "daily"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        written = 0
+        for year_str, year_df in prepared.groupby("year_str", sort=False):
+            written += self._write_daily_option_year(
+                out_dir=out_dir,
+                ul=ul,
+                year_str=year_str,
+                year_df=year_df,
+            )
+        return written
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -438,3 +497,183 @@ class LeanStorage(Destination):
                 }
             )
         return pd.DataFrame(rows)
+
+    def _prepare_daily_op(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Daily-option analog of `_prepare`.
+
+        Adds `year_str`, `date_compact`, `strike_deci`, `expiry_str`,
+        `right`, deci-cent O/H/L/C, integer V/OI. Drops rows missing
+        any column needed to build a contract entry.
+        """
+        required = {"strike", "expiry", "option_type", "datetime"}
+        if not required.issubset(df.columns):
+            return df.iloc[0:0]
+
+        out = df.copy()
+        out["datetime"] = out["datetime"].astype(str)
+        out["year_str"] = out["datetime"].str[0:4]
+        out["date_compact"] = out["datetime"].str[0:10].str.replace(
+            "-", "", regex=False
+        )
+
+        out["strike_deci"] = (
+            pd.to_numeric(out["strike"], errors="coerce")
+            .mul(_DECI_CENT_MULTIPLIER)
+            .round()
+            .astype("Int64")
+        )
+        out["expiry_str"] = (
+            out["expiry"].astype(str).str.replace("-", "", regex=False)
+        )
+        out["right"] = out["option_type"].map(_RIGHT_FROM_OPTION_TYPE)
+
+        for src, dst in (
+            ("open", "o_deci"),
+            ("high", "h_deci"),
+            ("low", "l_deci"),
+            ("close", "c_deci"),
+        ):
+            if src in out.columns:
+                out[dst] = (
+                    pd.to_numeric(out[src], errors="coerce")
+                    .mul(_DECI_CENT_MULTIPLIER)
+                    .round()
+                    .astype("Int64")
+                )
+            else:
+                out[dst] = pd.array([pd.NA] * len(out), dtype="Int64")
+
+        if "volume" in out.columns:
+            out["volume_int"] = (
+                pd.to_numeric(out["volume"], errors="coerce")
+                .round()
+                .astype("Int64")
+            )
+        else:
+            out["volume_int"] = pd.array([pd.NA] * len(out), dtype="Int64")
+
+        if "oi" in out.columns:
+            out["oi_int"] = (
+                pd.to_numeric(out["oi"], errors="coerce").round().astype("Int64")
+            )
+        else:
+            out["oi_int"] = pd.array([pd.NA] * len(out), dtype="Int64")
+
+        out = out.dropna(subset=["strike_deci", "right"])
+        out = out[out["expiry_str"].str.len() == 8]
+        out = out[out["date_compact"].str.len() == 8]
+        out = out[out["year_str"].str.len() == 4]
+        return out
+
+    def _write_daily_option_year(
+        self,
+        *,
+        out_dir: Path,
+        ul: str,
+        year_str: str,
+        year_df: pd.DataFrame,
+    ) -> int:
+        """Write the trade and (if present) OI zip for one year.
+
+        Read-modify-write: existing entries' rows are loaded keyed by
+        date and merged with incoming. Returns the count of zips
+        actually written (1 or 2).
+        """
+        written = 0
+        style = self.option_style
+
+        # ---- Trade zip ----
+        trade_rows = year_df[year_df["o_deci"].notna()]
+        if not trade_rows.empty:
+            zpath = out_dir / f"{ul}_{year_str}_trade_{style}.zip"
+            existing = self._read_daily_option_zip(zpath, tick_type="trade")
+            entries: dict[str, dict[str, str]] = existing or {}
+
+            for (strike_deci, expiry_str, right), group in trade_rows.groupby(
+                ["strike_deci", "expiry_str", "right"], sort=False
+            ):
+                long_right = _LONG_FROM_RIGHT[right]
+                entry = (
+                    f"{ul}_trade_{style}_{long_right}"
+                    f"_{int(strike_deci)}_{expiry_str}.csv"
+                )
+                bucket = entries.setdefault(entry, {})
+                for r in group.itertuples(index=False):
+                    line = (
+                        f"{r.date_compact} 00:00,"
+                        f"{int(r.o_deci)},{int(r.h_deci)},"
+                        f"{int(r.l_deci)},{int(r.c_deci)},"
+                        f"{int(r.volume_int) if not pd.isna(r.volume_int) else 0}"
+                    )
+                    bucket[r.date_compact] = line  # incoming wins
+
+            self._flush_daily_option_zip(zpath, entries)
+            written += 1
+
+        # ---- OI zip ----
+        oi_rows = year_df[year_df["oi_int"].notna() & (year_df["oi_int"] > 0)]
+        if not oi_rows.empty:
+            zpath = out_dir / f"{ul}_{year_str}_openinterest_{style}.zip"
+            existing = self._read_daily_option_zip(zpath, tick_type="openinterest")
+            entries = existing or {}
+
+            for (strike_deci, expiry_str, right), group in oi_rows.groupby(
+                ["strike_deci", "expiry_str", "right"], sort=False
+            ):
+                long_right = _LONG_FROM_RIGHT[right]
+                entry = (
+                    f"{ul}_openinterest_{style}_{long_right}"
+                    f"_{int(strike_deci)}_{expiry_str}.csv"
+                )
+                bucket = entries.setdefault(entry, {})
+                for r in group.itertuples(index=False):
+                    line = f"{r.date_compact} 00:00,{int(r.oi_int)}"
+                    bucket[r.date_compact] = line
+
+            self._flush_daily_option_zip(zpath, entries)
+            written += 1
+
+        return written
+
+    @staticmethod
+    def _read_daily_option_zip(
+        zpath: Path, *, tick_type: str
+    ) -> dict[str, dict[str, str]] | None:
+        """Decode an existing daily-option zip into {entry: {date: line}}.
+
+        Used by the read-modify-write merge so re-runs don't drop
+        previously-written days. Lines are kept as-is — they get
+        re-emitted verbatim if the date isn't overwritten by incoming.
+        `tick_type` is unused today but accepted so the call sites
+        document what they're loading.
+        """
+        if not zpath.exists():
+            return None
+        out: dict[str, dict[str, str]] = {}
+        with zipfile.ZipFile(zpath, "r") as zf:
+            for name in zf.namelist():
+                raw = zf.read(name).decode()
+                bucket: dict[str, str] = {}
+                for line in raw.splitlines():
+                    if not line.strip():
+                        continue
+                    # First field is "YYYYMMDD HH:mm" — date is the
+                    # leading 8 chars of that field.
+                    date_compact = line.split(",", 1)[0].split(" ", 1)[0]
+                    if len(date_compact) != 8:
+                        continue
+                    bucket[date_compact] = line
+                if bucket:
+                    out[name] = bucket
+        return out
+
+    @staticmethod
+    def _flush_daily_option_zip(
+        zpath: Path, entries: dict[str, dict[str, str]]
+    ) -> None:
+        """Write `{entry: {date: line}}` to a fresh zip, ascending."""
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+            for entry_name in sorted(entries.keys()):
+                bucket = entries[entry_name]
+                body = "\n".join(bucket[d] for d in sorted(bucket.keys())) + "\n"
+                zf.writestr(entry_name, body)

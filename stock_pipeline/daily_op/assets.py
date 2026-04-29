@@ -17,7 +17,7 @@ Tags:
   source        "kite" | "csv"         default: kite  (kite is no-op for now)
   start_date    YYYY-MM-DD             default: 2000-01-01
   end_date      YYYY-MM-DD             default: today
-  storage       "local"                default: local
+  storage       "local" | "lean"       default: local
 """
 
 from datetime import date as date_cls
@@ -26,6 +26,7 @@ from pathlib import Path
 import pandas as pd
 from dagster import AssetExecutionContext, asset
 
+from stock_pipeline.core.destinations.lean import LeanStorage
 from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.partitions import option_contracts
 from stock_pipeline.core.sources.csv_source import CsvSource
@@ -43,7 +44,7 @@ from stock_pipeline.core.tags import (
 GROUP = "daily_op"
 
 # Whitelist grows as more Destination impls land.
-_VALID_STORAGES = ("local",)
+_VALID_STORAGES = ("local", "lean")
 
 # Helper columns — set in raw, read in the write asset for path routing,
 # dropped before parquet serialization. Leading underscore marks them private.
@@ -140,6 +141,7 @@ def option_daily_parquet(
     context: AssetExecutionContext,
     processed_option_daily: pd.DataFrame,
     local: LocalStorage,
+    lean: LeanStorage,
 ) -> None:
     if processed_option_daily.empty:
         context.log.warning("Empty DataFrame — skipping write")
@@ -150,13 +152,29 @@ def option_daily_parquet(
         raise ValueError(
             f"tag '{TAG_STORAGE}'='{storage}' invalid — must be one of {_VALID_STORAGES}"
         )
-    dest = local
 
     underlying = processed_option_daily[_UNDERLYING_COL].iloc[0]
 
-    # Fan out: one parquet per contract under this underlying. Merge+dedupe
-    # by DateTime so re-runs with overlapping ranges preserve old rows and
-    # update any that changed (e.g. corp-action adjustments later).
+    if storage == "lean":
+        # LeanStorage rebuilds contract identity from the typed
+        # strike/expiry/option_type columns, so the helper columns
+        # are dropped before handoff.
+        n = lean.write_daily_option(
+            processed_option_daily.drop(
+                columns=[_UNDERLYING_COL, _CONTRACT_COL]
+            ),
+            underlying=underlying,
+        )
+        context.log.info(
+            f"LEAN: wrote {n} zip(s) for {underlying} via storage={storage}"
+        )
+        return
+
+    # storage == "local": one parquet per contract under this
+    # underlying. Merge+dedupe by DateTime so re-runs with overlapping
+    # ranges preserve old rows and update any that changed (e.g.
+    # corp-action adjustments later).
+    dest = local
     for contract, group in processed_option_daily.groupby(_CONTRACT_COL, sort=False):
         fresh = group.drop(columns=[_UNDERLYING_COL, _CONTRACT_COL])
         rel = f"daily/op/{underlying}/{contract}.parquet"

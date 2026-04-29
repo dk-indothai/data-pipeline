@@ -449,13 +449,13 @@ Implemented (commit / roadmap snapshot at the time of this doc):
 | Group         | `source=csv` | `source=kite`     | `storage=local` | `storage=lean` |
 |---------------|--------------|-------------------|-----------------|----------------|
 | `daily_eq`    | ✓            | stub (no-op)      | ✓               | ✓              |
-| `daily_op`    | ✓            | stub (no-op)      | ✓               | _pending_      |
+| `daily_op`    | ✓            | stub (no-op)      | ✓               | ✓              |
 | `intraday_eq` | ✓            | ✓                 | ✓               | _pending_      |
 | `intraday_op` | ✓            | stub (no-op)      | ✓               | ✓              |
 
 The `option_contracts_sync` sensor cap-batching (2000/tick) and the
 `tag_concurrency_limits` rule (one run per partition value) are both
 production-side guarantees the pipeline now relies on; deferred work
-includes wiring `storage=lean` for `daily_op` / `intraday_eq`,
+includes wiring `storage=lean` for `intraday_eq`,
 populating the LEAN universe row's underlying bar, and turning the
 Kite stubs into real fetches for option flows.
