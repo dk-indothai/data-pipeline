@@ -140,10 +140,44 @@ on source type.
 | `FakeKiteSource`  | Deterministic generator  | Same shape as Kite; activated when `KITE_API_KEY` is unset. Lets you exercise the full DAG offline. |
 | `CsvSource`       | Local filesystem (`CSV_ROOT_DIR`) | Pre-downloaded CSVs. The `intraday_op` reader uses PyArrow streaming + per-batch date prefix filter to handle multi-GB files without OOM. |
 
+**CSV layout under `CSV_ROOT_DIR`** (defaults to `CustomSource`; the
+local install uses `old_data/`):
+
+```
+{CSV_ROOT_DIR}/
+├── daily/
+│   ├── eq/
+│   │   └── {SYMBOL}.csv          ← read by daily_eq
+│   │       cols: date,open,high,low,close,volume
+│   └── op/
+│       └── {UNDERLYING}/
+│           └── {CONTRACT}.csv    ← read by daily_op (one file per contract)
+│               cols: DateTime,srno,Ticker,Symbol,Strike,Expiry,
+│                     OptionType,Open,High,Low,Close,Volume,
+│                     Open Interest,lot size,Exchange
+└── intraday/
+    ├── eq/
+    │   └── {SYMBOL}.csv          ← read by intraday_eq
+    │       cols: date,open,high,low,close,volume
+    └── op/
+        └── {UNDERLYING}.csv      ← read by intraday_op (multi-contract;
+                                    fans out by Ticker at read time)
+            cols: same as daily/op (every contract for the underlying
+                  interleaved in one file; multi-GB)
+```
+
+Conventions:
+- `{SYMBOL}` is uppercased NSE/EQ tradingsymbol (`RELIANCE`, `HDFCBANK`).
+- `{UNDERLYING}` is uppercased index/option underlying (`NIFTY`, `BANKNIFTY`).
+- `{CONTRACT}` follows daily_op's `{UND}_{STRIKE}_{TYPE}_{DD}_{MON}_{YY}`
+  convention (e.g. `NIFTY_19750_CE_01_FEB_24`).
+- Column casing differs between equity and option CSVs — the option
+  reader normalizes via `_OP_COLUMN_NORMALIZE` in `csv_source.py`.
+
 **Source selection** is per-run via the `source` tag (`kite` or `csv`).
-Kite paths in option flows are stubbed today (`source=kite` returns an
-empty frame for `daily_op` / `intraday_op`); the live-data pull is
-deferred until equity flows are stable.
+All Kite paths are stubbed today (`source=kite` returns an empty frame
+across all four groups); the live-data pull is deferred until each
+group's CSV path stabilizes.
 
 ### 3.2 Destinations (`core/destinations/`)
 
@@ -449,13 +483,12 @@ Implemented (commit / roadmap snapshot at the time of this doc):
 | Group         | `source=csv` | `source=kite`     | `storage=local` | `storage=lean` |
 |---------------|--------------|-------------------|-----------------|----------------|
 | `daily_eq`    | ✓            | stub (no-op)      | ✓               | ✓              |
-| `daily_op`    | ✓            | stub (no-op)      | ✓               | _pending_      |
-| `intraday_eq` | ✓            | ✓                 | ✓               | _pending_      |
+| `daily_op`    | ✓            | stub (no-op)      | ✓               | ✓              |
+| `intraday_eq` | ✓            | stub (no-op)      | ✓               | ✓              |
 | `intraday_op` | ✓            | stub (no-op)      | ✓               | ✓              |
 
 The `option_contracts_sync` sensor cap-batching (2000/tick) and the
 `tag_concurrency_limits` rule (one run per partition value) are both
 production-side guarantees the pipeline now relies on; deferred work
-includes wiring `storage=lean` for `daily_op` / `intraday_eq`,
-populating the LEAN universe row's underlying bar, and turning the
-Kite stubs into real fetches for option flows.
+includes populating the LEAN universe row's underlying bar and turning
+the Kite stubs into real fetches across all four flows.

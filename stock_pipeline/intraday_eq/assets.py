@@ -1,15 +1,18 @@
 """Intraday equity pipeline: fetch minute candles over a date range.
 
 One partition is one symbol; one run processes every weekday in
-[start_date, end_date] and writes a separate parquet per trading day.
+[start_date, end_date] and writes a separate parquet (or LEAN zip) per
+trading day.
 
 Tags:
-  source        "kite" | "csv"         default: kite
+  source        "kite" | "csv"         default: kite (kite is no-op stub)
   start_date    YYYY-MM-DD             default: 2015-02-02 (earliest CSV)
   end_date      YYYY-MM-DD             default: today
+  storage       "local" | "lean"       default: local
 
-Output: data/intraday/equity/{SYMBOL}/{DATE}.parquet (one file per date
-that had data; empty days are skipped).
+Output:
+  storage=local  data/intraday/eq/{symbol}/{date}.parquet
+  storage=lean   lean_data/equity/{country}/minute/{symbol}/{YYYYMMDD}_trade.zip
 """
 
 from datetime import date as date_cls
@@ -19,6 +22,7 @@ from dagster import AssetExecutionContext, asset
 from sqlalchemy import select
 
 from stock_pipeline.core.db import PostgresResource
+from stock_pipeline.core.destinations.lean import LeanStorage
 from stock_pipeline.core.destinations.local import LocalStorage
 from stock_pipeline.core.models import Instrument
 from stock_pipeline.core.partitions import equity_symbols
@@ -36,7 +40,7 @@ from stock_pipeline.core.tags import (
 GROUP = "intraday_eq"
 
 # Whitelist grows as more Destination impls land (s3, drive_local, ...).
-_VALID_STORAGES = ("local",)
+_VALID_STORAGES = ("local", "lean")
 
 # Earliest date present in the intraday CSVs; daily_eod's 2000-01-01 default
 # is too wide and would iterate ~15 years of weekends for nothing.
@@ -64,6 +68,12 @@ def raw_intraday(
             f"tag '{TAG_SOURCE}'='{source}' invalid — must be 'kite' or 'csv'"
         )
 
+    if source == "kite":
+        context.log.info(
+            f"source=kite for {symbol} — skipping (not implemented for intraday eq)"
+        )
+        return pd.DataFrame()
+
     from_date = date_cls.fromisoformat(
         tags.get(TAG_START_DATE, DEFAULT_INTRADAY_START_DATE)
     )
@@ -87,12 +97,11 @@ def raw_intraday(
             f"check the sensor or the universe filter."
         )
 
-    src = kite if source == "kite" else csv
     context.log.info(
         f"Fetching intraday {symbol} (token={token}) "
-        f"[{from_date}, {to_date}] via {source}"
+        f"[{from_date}, {to_date}] via csv"
     )
-    df = src.fetch_intraday_eq_range(
+    df = csv.fetch_intraday_eq_range(
         symbol=symbol,
         instrument_token=token,
         from_date=from_date,
@@ -125,6 +134,7 @@ def intraday_parquet(
     context: AssetExecutionContext,
     processed_intraday: pd.DataFrame,
     local: LocalStorage,
+    lean: LeanStorage,
 ) -> None:
     if processed_intraday.empty:
         context.log.warning("Empty DataFrame — skipping write")
@@ -135,16 +145,36 @@ def intraday_parquet(
         raise ValueError(
             f"tag '{TAG_STORAGE}'='{storage}' invalid — must be one of {_VALID_STORAGES}"
         )
-    dest = local  # only local impl today; dispatch grows when S3/Drive land.
 
     symbol = context.partition_key
 
-    # Split by trading_date and write one parquet per day. Writes overwrite
+    if storage == "lean":
+        # Per-day zips at equity/{country}/minute/{symbol}/. LeanStorage
+        # owns its own overwrite semantics, so this branch stays tight.
+        written = 0
+        for trading_date, group in processed_intraday.groupby(
+            _TRADING_DATE_COL, sort=False
+        ):
+            n = lean.write_minute_equity_day(
+                group.drop(columns=[_TRADING_DATE_COL]),
+                symbol=symbol,
+                date_str=trading_date,
+            )
+            context.log.info(
+                f"LEAN: wrote {n} file(s) for {symbol} on {trading_date}"
+            )
+            written += n
+        context.log.info(
+            f"{symbol}: wrote {written} LEAN file(s) via storage={storage}"
+        )
+        return
+
+    # storage == "local": one parquet per trading day. Writes overwrite
     # atomically — re-materializing a range refreshes every file in scope.
     written = 0
     for trading_date, group in processed_intraday.groupby(_TRADING_DATE_COL):
         rel = f"intraday/eq/{symbol}/{trading_date}.parquet"
-        dest.write(group.drop(columns=[_TRADING_DATE_COL]), rel)
+        local.write(group.drop(columns=[_TRADING_DATE_COL]), rel)
         context.log.info(f"Wrote {rel} ({len(group)} rows)")
         written += 1
 
