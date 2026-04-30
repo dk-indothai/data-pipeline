@@ -1,7 +1,7 @@
 """Sync NFO/BFO option contracts from Postgres into Dagster's dynamic
-partition store. Filter: non-expired CE/PE in NFO-OPT or BFO-OPT, narrowed
-to the tracked underlyings (TRACKED_OPTION_UNDERLYINGS env var). In dev
-(ENV=dev) the query is also capped at 5.
+partition store. Filter: rows present in both Kite `instruments` and
+Symphony, segment in NSE / NFO-OPT. In dev (ENV=dev) the query is
+capped at 5.
 """
 
 import os
@@ -22,18 +22,6 @@ from stock_pipeline.core.partitions import option_contracts
 
 IS_DEV = os.getenv("ENV", "prod").lower() == "dev"
 DEV_CONTRACT_LIMIT = 5
-
-# Default underlyings: the major index options (covers >90% of liquid
-# options volume on NFO). Override via TRACKED_OPTION_UNDERLYINGS=A,B,C
-# in .env to pick a different set.
-_DEFAULT_UNDERLYINGS = ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX")
-
-_env_raw = os.getenv("TRACKED_OPTION_UNDERLYINGS", "").strip()
-TRACKED_UNDERLYINGS: tuple[str, ...] = (
-    tuple(s.strip() for s in _env_raw.split(",") if s.strip())
-    if _env_raw
-    else _DEFAULT_UNDERLYINGS
-)
 
 # Cap per tick. Registering tens of thousands in one shot overruns the
 # sensor tick timeout and Dagster silently drops the whole batch. Smaller
@@ -71,8 +59,7 @@ def option_contracts_sync(context: SensorEvaluationContext, db: PostgresResource
 
     context.log.info(
         f"[SENSOR] option contracts from DB: {len(found)} "
-        f"(underlyings={list(TRACKED_UNDERLYINGS)}, "
-        f"ENV={'dev' if IS_DEV else 'prod'})"
+        f"(ENV={'dev' if IS_DEV else 'prod'})"
     )
 
     if not found:

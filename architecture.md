@@ -117,7 +117,7 @@ data-pipeline/
 ├── run.sh                             Local startup helper.
 ├── pyproject.toml                     Package + deps.
 ├── .env.example                       DATABASE_URL, KITE_*, CSV_ROOT_DIR,
-│                                      LEAN_STORAGE_DIR, ENV, TRACKED_OPTION_UNDERLYINGS
+│                                      LEAN_STORAGE_DIR, ENV
 └── README.md
 ```
 
@@ -217,8 +217,8 @@ them:
 - `equity_symbols` — used by `daily_eq` and `intraday_eq`. Populated by
   `equity_symbols_sync` (NSE/EQ rows joined Kite ↔ Symphony).
 - `option_contracts` — used by `daily_op` and `intraday_op`. Populated
-  by `option_contracts_sync` (NFO-OPT, narrowed to
-  `TRACKED_OPTION_UNDERLYINGS` — defaults to NIFTY/BANKNIFTY/FINNIFTY/SENSEX).
+  by `option_contracts_sync` (rows present in both Kite `instruments`
+  and Symphony, segment in NSE / NFO-OPT).
 
 The partition key for **option** flows is the **underlying symbol**
 (e.g. `NIFTY`), not a contract trading symbol. This is intentional:
@@ -437,7 +437,6 @@ Dagster path.
 | `LEAN_COUNTRY`               | LEAN tree country segment                                       | `india`                          |
 | `LEAN_OPTION_STYLE`          | LEAN filename style token                                       | `american`                       |
 | `ENV`                        | `dev` caps sensor universes at 5 partitions                     | `prod`                           |
-| `TRACKED_OPTION_UNDERLYINGS` | Comma-list of underlyings for `option_contracts_sync`           | `NIFTY,BANKNIFTY,FINNIFTY,SENSEX`|
 | `DAGSTER_HOME`               | Dagster instance dir                                            | `./.dagster_home` (set by `run.sh`) |
 
 ---
