@@ -15,6 +15,7 @@ from stock_pipeline.daily_op import assets as daily_op_assets
 from stock_pipeline.daily_op.sensor import option_contracts_sync
 from stock_pipeline.intraday_eq import assets as intraday_eq_assets
 from stock_pipeline.intraday_op import assets as intraday_op_assets
+from test import test_jobs
 
 # os.getenv (not EnvVar) so CSV_ROOT_DIR stays optional — falls back to the
 # class default when unset. Dagster auto-loads .env from the working dir.
@@ -31,6 +32,7 @@ defs = Definitions(
         equity_symbols_sync,
         option_contracts_sync,
     ],
+    jobs=test_jobs,
     resources={
         "kite": KiteSource(
             api_key=EnvVar("KITE_API_KEY"),

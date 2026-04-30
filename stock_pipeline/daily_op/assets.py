@@ -52,7 +52,6 @@ _UNDERLYING_COL = "_underlying"
 _CONTRACT_COL = "_contract"
 
 
-
 @asset(partitions_def=option_contracts, group_name=GROUP)
 def raw_option_daily(
     context: AssetExecutionContext,
@@ -73,54 +72,63 @@ def raw_option_daily(
             f"source=kite for {underlying} — skipping (not implemented for per-underlying flow)"
         )
         return pd.DataFrame()
+    elif source == "csv":
+        start_tag = tags.get(TAG_START_DATE, DEFAULT_START_DATE)
+        end_tag = tags.get(TAG_END_DATE)
+        try:
+            from_date = date_cls.fromisoformat(start_tag)
+            to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
+        except ValueError as e:
+            raise ValueError(
+                f"bad date tag — start_date={start_tag!r} end_date={end_tag!r}: {e}"
+            ) from e
 
-    from_date = date_cls.fromisoformat(tags.get(TAG_START_DATE, DEFAULT_START_DATE))
-    end_tag = tags.get(TAG_END_DATE)
-    to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
+        op_dir = Path(csv.root_dir) / "daily" / "op" / underlying
+        if not op_dir.exists():
+            context.log.warning(f"no folder at {op_dir} for {underlying}")
+            return pd.DataFrame()
 
-    op_dir = Path(csv.root_dir) / "daily" / "op" / underlying
-    if not op_dir.exists():
-        context.log.warning(f"no folder at {op_dir} for {underlying}")
-        return pd.DataFrame()
+        contract_files = sorted(op_dir.glob("*.csv"))
+        if not contract_files:
+            context.log.warning(f"no contract CSVs under {op_dir}")
+            return pd.DataFrame()
 
-    contract_files = sorted(op_dir.glob("*.csv"))
-    if not contract_files:
-        context.log.warning(f"no contract CSVs under {op_dir}")
-        return pd.DataFrame()
+        frames: list[pd.DataFrame] = []
+        for path in contract_files:
+            contract = path.stem
+            df = csv.fetch_daily_op_range(
+                contract=contract,
+                underlying=underlying,
+                instrument_token=0,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            if df.empty:
+                continue
+            # OI may be missing from legacy CSVs; materialize an empty column so
+            # the rename + output-projection downstream has something to hit.
+            if "oi" not in df.columns:
+                df["oi"] = pd.NA
+            df[_CONTRACT_COL] = contract
+            df[_UNDERLYING_COL] = underlying
+            frames.append(df)
 
-    frames: list[pd.DataFrame] = []
-    for path in contract_files:
-        contract = path.stem
-        df = csv.fetch_daily_op_range(
-            contract=contract,
-            underlying=underlying,
-            instrument_token=0,
-            from_date=from_date,
-            to_date=to_date,
+        if not frames:
+            context.log.warning(
+                f"no rows for {underlying} in [{from_date}, {to_date}] "
+                f"across {len(contract_files)} contract files"
+            )
+            return pd.DataFrame()
+
+        combined = pd.concat(frames, ignore_index=True)
+        context.log.info(
+            f"fetched {len(combined)} rows across {len(frames)} contracts "
+            f"for {underlying} via csv in [{from_date}, {to_date}]"
         )
-        if df.empty:
-            continue
-        # OI may be missing from legacy CSVs; materialize an empty column so
-        # the rename + output-projection downstream has something to hit.
-        if "oi" not in df.columns:
-            df["oi"] = pd.NA
-        df[_CONTRACT_COL] = contract
-        df[_UNDERLYING_COL] = underlying
-        frames.append(df)
-
-    if not frames:
-        context.log.warning(
-            f"no rows for {underlying} in [{from_date}, {to_date}] "
-            f"across {len(contract_files)} contract files"
-        )
+        return combined
+    else:
+        context.log.warning(f"unsupported source: {source}")
         return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True)
-    context.log.info(
-        f"fetched {len(combined)} rows across {len(frames)} contracts "
-        f"for {underlying} via csv in [{from_date}, {to_date}]"
-    )
-    return combined
 
 
 @asset(partitions_def=option_contracts, group_name=GROUP)
@@ -160,30 +168,34 @@ def option_daily_parquet(
         # strike/expiry/option_type columns, so the helper columns
         # are dropped before handoff.
         n = lean.write_daily_option(
-            processed_option_daily.drop(
-                columns=[_UNDERLYING_COL, _CONTRACT_COL]
-            ),
+            processed_option_daily.drop(columns=[_UNDERLYING_COL, _CONTRACT_COL]),
             underlying=underlying,
         )
         context.log.info(
             f"LEAN: wrote {n} zip(s) for {underlying} via storage={storage}"
         )
         return
-
-    # storage == "local": one parquet per contract under this
-    # underlying. Merge+dedupe by DateTime so re-runs with overlapping
-    # ranges preserve old rows and update any that changed (e.g.
-    # corp-action adjustments later).
-    dest = local
-    for contract, group in processed_option_daily.groupby(_CONTRACT_COL, sort=False):
-        fresh = group.drop(columns=[_UNDERLYING_COL, _CONTRACT_COL])
-        rel = f"daily/op/{underlying}/{contract}.parquet"
-        existing = dest.read(rel)
-        if not existing.empty:
-            combined = pd.concat([existing, fresh], ignore_index=True)
-            combined = combined.drop_duplicates(subset=["datetime"], keep="last")
-            combined = combined.sort_values("datetime").reset_index(drop=True)
-        else:
-            combined = fresh
-        dest.write(combined, rel)
-        context.log.info(f"Wrote {rel} ({len(combined)} rows) via storage={storage}")
+    elif storage == "local":
+        # storage == "local": one parquet per contract under this
+        # underlying. Merge+dedupe by DateTime so re-runs with overlapping
+        # ranges preserve old rows and update any that changed (e.g.
+        # corp-action adjustments later).
+        dest = local
+        for contract, group in processed_option_daily.groupby(
+            _CONTRACT_COL, sort=False
+        ):
+            fresh = group.drop(columns=[_UNDERLYING_COL, _CONTRACT_COL])
+            rel = f"daily/op/{underlying}/{contract}.parquet"
+            existing = dest.read(rel)
+            if not existing.empty:
+                combined = pd.concat([existing, fresh], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["datetime"], keep="last")
+                combined = combined.sort_values("datetime").reset_index(drop=True)
+            else:
+                combined = fresh
+            dest.write(combined, rel)
+            context.log.info(
+                f"Wrote {rel} ({len(combined)} rows) via storage={storage}"
+            )
+    else:
+        context.log.warning(f"unsupported storage: {storage}")

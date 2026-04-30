@@ -73,48 +73,57 @@ def raw_intraday(
             f"source=kite for {symbol} — skipping (not implemented for intraday eq)"
         )
         return pd.DataFrame()
+    elif source == "csv":
+        start_tag = tags.get(TAG_START_DATE, DEFAULT_INTRADAY_START_DATE)
+        end_tag = tags.get(TAG_END_DATE)
+        try:
+            from_date = date_cls.fromisoformat(start_tag)
+            to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
+        except ValueError as e:
+            raise ValueError(
+                f"bad date tag — start_date={start_tag!r} end_date={end_tag!r}: {e}"
+            ) from e
+        if to_date < from_date:
+            raise ValueError(f"end_date {to_date} < start_date {from_date}")
 
-    from_date = date_cls.fromisoformat(
-        tags.get(TAG_START_DATE, DEFAULT_INTRADAY_START_DATE)
-    )
-    end_tag = tags.get(TAG_END_DATE)
-    to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
-    if to_date < from_date:
-        raise ValueError(f"end_date {to_date} < start_date {from_date}")
+        # Kite's historical API requires instrument_token, not tradingsymbol.
+        with db.session() as s:
+            token = s.execute(
+                select(Instrument.instrument_token)
+                .where(Instrument.tradingsymbol == symbol)
+                .where(Instrument.exchange == "NSE")
+                .where(Instrument.instrument_type == "EQ")
+            ).scalar_one_or_none()
 
-    # Kite's historical API requires instrument_token, not tradingsymbol.
-    with db.session() as s:
-        token = s.execute(
-            select(Instrument.instrument_token)
-            .where(Instrument.tradingsymbol == symbol)
-            .where(Instrument.exchange == "NSE")
-            .where(Instrument.instrument_type == "EQ")
-        ).scalar_one_or_none()
+        if token is None:
+            raise ValueError(
+                f"{symbol} not found in instruments as NSE/EQ tradingsymbol — "
+                f"check the sensor or the universe filter."
+            )
 
-    if token is None:
-        raise ValueError(
-            f"{symbol} not found in instruments as NSE/EQ tradingsymbol — "
-            f"check the sensor or the universe filter."
+        context.log.info(
+            f"Fetching intraday {symbol} (token={token}) "
+            f"[{from_date}, {to_date}] via csv"
         )
+        df = csv.fetch_intraday_eq_range(
+            symbol=symbol,
+            instrument_token=token,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        if df.empty:
+            context.log.warning(
+                f"No intraday data for {symbol} in [{from_date}, {to_date}]"
+            )
+            return df
 
-    context.log.info(
-        f"Fetching intraday {symbol} (token={token}) "
-        f"[{from_date}, {to_date}] via csv"
-    )
-    df = csv.fetch_intraday_eq_range(
-        symbol=symbol,
-        instrument_token=token,
-        from_date=from_date,
-        to_date=to_date,
-    )
-    if df.empty:
-        context.log.warning(f"No intraday data for {symbol} in [{from_date}, {to_date}]")
+        # First 10 chars of the ISO timestamp are the YYYY-MM-DD slot — avoids
+        # reparsing the full datetime on a multi-million-row frame.
+        df[_TRADING_DATE_COL] = df["date"].str[:10]
         return df
-
-    # First 10 chars of the ISO timestamp are the YYYY-MM-DD slot — avoids
-    # reparsing the full datetime on a multi-million-row frame.
-    df[_TRADING_DATE_COL] = df["date"].str[:10]
-    return df
+    else:
+        context.log.warning(f"unsupported source: {source}")
+        return pd.DataFrame()
 
 
 @asset(partitions_def=equity_symbols, group_name=GROUP)
@@ -160,22 +169,24 @@ def intraday_parquet(
                 symbol=symbol,
                 date_str=trading_date,
             )
-            context.log.info(
-                f"LEAN: wrote {n} file(s) for {symbol} on {trading_date}"
-            )
+            context.log.info(f"LEAN: wrote {n} file(s) for {symbol} on {trading_date}")
             written += n
         context.log.info(
             f"{symbol}: wrote {written} LEAN file(s) via storage={storage}"
         )
         return
+    elif storage == "local":
+        # storage == "local": one parquet per trading day. Writes overwrite
+        # atomically — re-materializing a range refreshes every file in scope.
+        written = 0
+        for trading_date, group in processed_intraday.groupby(_TRADING_DATE_COL):
+            rel = f"intraday/eq/{symbol}/{trading_date}.parquet"
+            local.write(group.drop(columns=[_TRADING_DATE_COL]), rel)
+            context.log.info(f"Wrote {rel} ({len(group)} rows)")
+            written += 1
 
-    # storage == "local": one parquet per trading day. Writes overwrite
-    # atomically — re-materializing a range refreshes every file in scope.
-    written = 0
-    for trading_date, group in processed_intraday.groupby(_TRADING_DATE_COL):
-        rel = f"intraday/eq/{symbol}/{trading_date}.parquet"
-        local.write(group.drop(columns=[_TRADING_DATE_COL]), rel)
-        context.log.info(f"Wrote {rel} ({len(group)} rows)")
-        written += 1
-
-    context.log.info(f"{symbol}: wrote {written} parquet files via storage={storage}")
+        context.log.info(
+            f"{symbol}: wrote {written} parquet files via storage={storage}"
+        )
+    else:
+        context.log.warning(f"unsupported storage: {storage}")

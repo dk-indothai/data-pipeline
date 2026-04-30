@@ -59,35 +59,44 @@ def raw_daily(
             f"source=kite for {symbol} — skipping (not implemented for daily eq)"
         )
         return pd.DataFrame()
+    elif source == "csv":
+        start_tag = tags.get(TAG_START_DATE, DEFAULT_START_DATE)
+        end_tag = tags.get(TAG_END_DATE)
+        try:
+            from_date = date_cls.fromisoformat(start_tag)
+            to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
+        except ValueError as e:
+            raise ValueError(
+                f"bad date tag — start_date={start_tag!r} end_date={end_tag!r}: {e}"
+            ) from e
 
-    from_date = date_cls.fromisoformat(tags.get(TAG_START_DATE, DEFAULT_START_DATE))
-    end_tag = tags.get(TAG_END_DATE)
-    to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
+        # Kite's historical API requires instrument_token, not tradingsymbol.
+        # Partition key is `SymphonyInstruments.name` (sensor source), which
+        # corresponds to `Instrument.tradingsymbol` on the Kite side — not
+        # `Instrument.name` (that's the company name, e.g. "HDFC BANK").
+        with db.session() as s:
+            token = s.execute(
+                select(Instrument.instrument_token)
+                .where(Instrument.tradingsymbol == symbol)
+                .where(Instrument.exchange == "NSE")
+                .where(Instrument.instrument_type == "EQ")
+            ).scalar_one_or_none()
 
-    # Kite's historical API requires instrument_token, not tradingsymbol.
-    # Partition key is `SymphonyInstruments.name` (sensor source), which
-    # corresponds to `Instrument.tradingsymbol` on the Kite side — not
-    # `Instrument.name` (that's the company name, e.g. "HDFC BANK").
-    with db.session() as s:
-        token = s.execute(
-            select(Instrument.instrument_token)
-            .where(Instrument.tradingsymbol == symbol)
-            .where(Instrument.exchange == "NSE")
-            .where(Instrument.instrument_type == "EQ")
-        ).scalar_one_or_none()
+        if token is None:
+            raise ValueError(
+                f"{symbol} not found in instruments as NSE/EQ tradingsymbol — "
+                f"check the sensor or the universe filter."
+            )
 
-    if token is None:
-        raise ValueError(
-            f"{symbol} not found in instruments as NSE/EQ tradingsymbol — "
-            f"check the sensor or the universe filter."
+        context.log.info(
+            f"Fetching {symbol} (token={token}) for [{from_date}, {to_date}] via csv"
         )
-
-    context.log.info(
-        f"Fetching {symbol} (token={token}) for [{from_date}, {to_date}] via csv"
-    )
-    return csv.fetch_daily_eq_range(
-        symbol=symbol, instrument_token=token, from_date=from_date, to_date=to_date
-    )
+        return csv.fetch_daily_eq_range(
+            symbol=symbol, instrument_token=token, from_date=from_date, to_date=to_date
+        )
+    else:
+        context.log.warning(f"Unsupported source: {source}")
+        return pd.DataFrame()
 
 
 @asset(partitions_def=equity_symbols, group_name=GROUP)
@@ -125,21 +134,21 @@ def daily_parquet(
         # LeanStorage owns its own read-modify-write merge against the
         # existing zip, so this branch stays tight.
         n = lean.write_daily_equity(processed_daily, symbol=symbol)
-        context.log.info(
-            f"LEAN: wrote {n} file(s) for {symbol} via storage={storage}"
-        )
+        context.log.info(f"LEAN: wrote {n} file(s) for {symbol} via storage={storage}")
         return
-
-    # storage == "local": one parquet per symbol holds full history;
-    # merge + dedupe by date so each run contributes new rows without
-    # losing old ones.
-    rel = f"daily/eq/{symbol}.parquet"
-    existing = local.read(rel)
-    if not existing.empty:
-        combined = pd.concat([existing, processed_daily], ignore_index=True)
-        combined = combined.drop_duplicates(subset=["date"], keep="last")
-        combined = combined.sort_values("date").reset_index(drop=True)
+    elif storage == "local":
+        # storage == "local": one parquet per symbol holds full history;
+        # merge + dedupe by date so each run contributes new rows without
+        # losing old ones.
+        rel = f"daily/eq/{symbol}.parquet"
+        existing = local.read(rel)
+        if not existing.empty:
+            combined = pd.concat([existing, processed_daily], ignore_index=True)
+            combined = combined.drop_duplicates(subset=["date"], keep="last")
+            combined = combined.sort_values("date").reset_index(drop=True)
+        else:
+            combined = processed_daily
+        local.write(combined, rel)
+        context.log.info(f"Wrote {rel} ({len(combined)} rows) via storage={storage}")
     else:
-        combined = processed_daily
-    local.write(combined, rel)
-    context.log.info(f"Wrote {rel} ({len(combined)} rows) via storage={storage}")
+        context.log.warning(f"Unsupported storage: {storage}")

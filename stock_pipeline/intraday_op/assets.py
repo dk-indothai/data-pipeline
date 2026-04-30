@@ -76,31 +76,40 @@ def raw_intraday_op(
         )
         return pd.DataFrame()
 
-    from_date = date_cls.fromisoformat(
-        tags.get(TAG_START_DATE, DEFAULT_INTRADAY_START_DATE)
-    )
-    end_tag = tags.get(TAG_END_DATE)
-    to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
-    if to_date < from_date:
-        raise ValueError(f"end_date {to_date} < start_date {from_date}")
+    elif source == "csv":
+        start_tag = tags.get(TAG_START_DATE, DEFAULT_INTRADAY_START_DATE)
+        end_tag = tags.get(TAG_END_DATE)
+        try:
+            from_date = date_cls.fromisoformat(start_tag)
+            to_date = date_cls.fromisoformat(end_tag) if end_tag else date_cls.today()
+        except ValueError as e:
+            raise ValueError(
+                f"bad date tag — start_date={start_tag!r} end_date={end_tag!r}: {e}"
+            ) from e
+        if to_date < from_date:
+            raise ValueError(f"end_date {to_date} < start_date {from_date}")
 
-    df = csv.fetch_intraday_op_range(
-        underlying=underlying, from_date=from_date, to_date=to_date
-    )
-    if df.empty:
-        context.log.warning(f"no rows for {underlying} in [{from_date}, {to_date}]")
+        df = csv.fetch_intraday_op_range(
+            underlying=underlying, from_date=from_date, to_date=to_date
+        )
+        if df.empty:
+            context.log.warning(f"no rows for {underlying} in [{from_date}, {to_date}]")
+            return df
+
+        df[_UNDERLYING_COL] = underlying
+        # First 10 chars of the ISO timestamp are the YYYY-MM-DD slot — avoids
+        # reparsing the full datetime on a multi-million-row frame.
+        df[_TRADING_DATE_COL] = df["datetime"].str[:10]
+
+        context.log.info(
+            f"fetched {len(df)} rows across {df[_CONTRACT_COL].nunique()} contracts "
+            f"for {underlying} via csv in [{from_date}, {to_date}]"
+        )
         return df
 
-    df[_UNDERLYING_COL] = underlying
-    # First 10 chars of the ISO timestamp are the YYYY-MM-DD slot — avoids
-    # reparsing the full datetime on a multi-million-row frame.
-    df[_TRADING_DATE_COL] = df["datetime"].str[:10]
-
-    context.log.info(
-        f"fetched {len(df)} rows across {df[_CONTRACT_COL].nunique()} contracts "
-        f"for {underlying} via csv in [{from_date}, {to_date}]"
-    )
-    return df
+    else:
+        context.log.warning(f"unsupported source: {source}")
+        return pd.DataFrame()
 
 
 @asset(partitions_def=option_contracts, group_name=GROUP)
@@ -157,22 +166,26 @@ def intraday_op_parquet(
         )
         return
 
-    # storage == "local": one parquet per (contract, trading_date) under
-    # this underlying. Writes overwrite atomically — re-materializing a
-    # range refreshes every file in scope without merge/dedupe overhead.
-    dest = local
-    written = 0
-    for (contract, trading_date), group in processed_intraday_op.groupby(
-        [_CONTRACT_COL, _TRADING_DATE_COL], sort=False
-    ):
-        rel = f"intraday/op/{underlying}/{trading_date}/{contract}.parquet"
-        dest.write(
-            group.drop(columns=[_UNDERLYING_COL, _TRADING_DATE_COL]),
-            rel,
-        )
-        context.log.info(f"Wrote {rel} ({len(group)} rows)")
-        written += 1
+    elif storage == "local":
+        # storage == "local": one parquet per (contract, trading_date) under
+        # this underlying. Writes overwrite atomically — re-materializing a
+        # range refreshes every file in scope without merge/dedupe overhead.
+        dest = local
+        written = 0
+        for (contract, trading_date), group in processed_intraday_op.groupby(
+            [_CONTRACT_COL, _TRADING_DATE_COL], sort=False
+        ):
+            rel = f"intraday/op/{underlying}/{trading_date}/{contract}.parquet"
+            dest.write(
+                group.drop(columns=[_UNDERLYING_COL, _TRADING_DATE_COL]),
+                rel,
+            )
+            context.log.info(f"Wrote {rel} ({len(group)} rows)")
+            written += 1
 
-    context.log.info(
-        f"{underlying}: wrote {written} parquet files via storage={storage}"
-    )
+        context.log.info(
+            f"{underlying}: wrote {written} parquet files via storage={storage}"
+        )
+    else:
+        context.log.warning(f"unsupported storage: {storage}")
+        return
